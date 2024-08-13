@@ -1,25 +1,20 @@
 import geopandas as gpd
 import pandas as pd
-import os
 import numpy as np
 import xarray as xr
 import rioxarray as rxr
-import dask
 from functools import partial
 
 from shapely.geometry import Polygon
-from shapely.geometry import Point
-import hvplot.pandas
-import hvplot.xarray
 from scipy import ndimage
 import shapely.geometry
 
-import json
 import matplotlib.pyplot as plt
 from types import NoneType
+import dask
+dask.config.set(**{'array.slicing.split_large_chunks': False})
 
 import itslivetools
-dask.config.set(**{'array.slicing.split_large_chunks': False})
 
 ##################################################################################
 
@@ -33,17 +28,19 @@ def get_urls(
 
     Parameters
     ----------
-    area (gpd.GeoDataFrame | tuple | list):
+    area (gpd.GeoDataFrame | tuple | list, optional):
         GeoDataFrame of the reference area, a singular point as a list or tuple,
-        or a list or tuple of points.
-
+        or a list or tuple of points. Points should be passed as (lon, lat).
+        If none are passed, all URLs from the specified EPSG number will be returned
     epsg (int, optional):
-        integer value of the CRS of the GeoDataFrame passed. Default: 3031
+        If area is GeoDataFrame, value must be same as the CRS of the gdf. 
+        If area is none, returns all URLs from the EPSG number passed.
+        Default: 3031
 
     Returns
     -------
     urls:
-        list of URLs to download data
+        list of data cube URLs from ITS_LIVE catalog
     '''
     # sanitize inputs, raise errors: 
     assert isinstance(area, (tuple, list, gpd.GeoDataFrame, NoneType)), "area must be a tuple, list, or GeoDataFrame"
@@ -85,22 +82,20 @@ def get_urls(
     if point:
         # 
         if multi:
-            url = [itslivetools.find_granule_by_point(pt) for pt in area]
-            
+            urls = [itslivetools.find_granule_by_point(pt) for pt in area]
+
         else:
             # use itslivetools 
-            url = itslivetools.find_granule_by_point(area)
+            urls = [itslivetools.find_granule_by_point(area)]
 
-        return url
+        return urls
     
     # is area passed is a GeoDataFrame
     elif gdf:
-        # Read in ITSLIVE json catalog
+        # Read in ITSLIVE json catalog, and write to crs
         catalog = gpd.read_file('https://its-live-data.s3.amazonaws.com/datacubes/catalog_v02.json')
-        # match the EPSG passed
-        catalog = catalog[catalog['epsg'] == epsg]
         catalog = catalog.to_crs(f'EPSG:{epsg}')
-    
+
         # Use a spatial join to match URLs of the catalog to the shapes in the shapefile
         catalog_sub = gpd.sjoin(area, catalog, how='inner')
     
@@ -110,7 +105,8 @@ def get_urls(
 
     else:
         catalog = gpd.read_file('https://its-live-data.s3.amazonaws.com/datacubes/catalog_v02.json')
-        urls = catalog.drop_duplicates('zarr_url').zarr_url.values.tolist()
+        catalog_sub = catalog[catalog['epsg'] == epsg]
+        urls = catalog_sub.drop_duplicates('zarr_url').zarr_url.values.tolist()
         return urls
 
 ##################################################################################
@@ -130,14 +126,18 @@ def get_data_cube(
 
     Parameters:
     -----------
-    shape (gpd.GeoDataFrame):
-        GeoDataFrame in with the corresponding crs to clip data cubes to
+    shape (gpd.GeoDataFrame, optional):
+        GeoDataFrame of shape to clip the datacubes. If not passed, datacubes will be returned in full
     urls (tuple | list | np.ndarray, optional):
-        If none, calls get_urls function for the shapefile. If urls are passed, 
+        If none, calls get_urls function for the shapefile/EPSG. If urls are passed, 
         skips function and opens files from given list. Must all be of same engine.
         Defaults to None
     epsg (int, optional):
-        epsg number of the CRS used in shapefile
+        epsg number of the CRS used in shape
+
+    Returns:
+    --------
+    dc ()
     '''
     # Type errors
     assert isinstance(shape, (gpd.GeoDataFrame, NoneType)), "Shape must be type gpd.GeoDataFrame or be None"
@@ -161,21 +161,16 @@ def get_data_cube(
         assert isinstance(urls, (tuple, list, np.ndarray)), "URLs must be passed as list, tuple, or array"
         assert all(isinstance(url, str) for url in urls), "Each item in urls must be a string"
         
-    # chunks to pass
+    # chunks to pass to
     chunks = {'mid_date':-1, 'x':'auto', 'y':'auto'}
     
-    if gdf:
-        # Use partial function to pass shape to the preprocessing function
-        # From xr.open_mfdataset documentation
-        preprocess = partial(_preprocess, shape=shape, epsg=epsg)
+    # Use partial function to pass shape to the preprocessing function
+    # From xr.open_mfdataset documentation
+    preprocess = partial(_preprocess, shape=shape, epsg=epsg, gdf=gdf)
 
-        # opens multiple datasets. Chunks time=-1 to make sortby easier
-        dc = xr.open_mfdataset(urls, engine=engine, preprocess=preprocess, 
-                               chunks=chunks, combine='nested', concat_dim='mid_date').chunk(mid_date=-1)
-
-    else:
-        dc = xr.open_mfdataset(urls, engine=engine, chunks=chunks, 
-                               combine='nested', concat_dim='mid_date').chunk(mid_date=-1)
+    # opens multiple datasets. Chunks time=-1 to make sortby easier
+    dc = xr.open_mfdataset(urls, engine=engine, preprocess=preprocess, 
+                           chunks=chunks, combine='nested', concat_dim='mid_date').chunk(mid_date=-1)
     
     # sort by mid_date, resample by month, taking mean per month
     dc = dc.sortby('mid_date').resample(mid_date='1ME').mean(dim='mid_date', skipna=True).chunk('auto')
@@ -183,7 +178,7 @@ def get_data_cube(
 
 ##################################################################################
 
-def _preprocess(ds, shape, epsg):
+def _preprocess(ds, shape, epsg, gdf):
     '''
     Preprocessing function for xr.open_mfdataset is as follows:
         - Refines datasets to only the x- and y-velocities, and their corresponding errors.
@@ -199,13 +194,13 @@ def _preprocess(ds, shape, epsg):
     # clip to 2015-present
     ds = ds.where(ds.mid_date.dt.year >= 2015, drop=True)
 
-    # Write CRS to data and clip to blue ice regions geometry
-    ds = ds.rio.write_crs(f'EPSG:{epsg}')
-    ds = ds.rio.clip(shape.geometry, shape.crs)
+    if gdf:
+        # Write CRS to data and clip to blue ice regions geometry
+        ds = ds.rio.write_crs(f'EPSG:{epsg}')
+        ds = ds.rio.clip(shape.geometry, shape.crs)
 
     # Sort by time variable
     ds = ds.sortby('mid_date')
-    
     return ds
     
 ##################################################################################
@@ -240,8 +235,9 @@ def compute_strain_stress(
 
     Returns:
     --------
-    xr.DataArray | np.ndarray:
-        returns dataarray or numpy arrays as (eps_eff, tau_vm)
+    tuple of np.ndarray | xr.DataArray:
+        returns dataarray or numpy arrays of computed variables 
+        Returns in order: ('eps_eff', 'eps_xx', 'eps_yy', 'sigma_vm', 'sigma1', 'sigma2')
     '''
     # Sanitize inputs, raise value errors
     assert (type(vx) == type(vy)), "Input velocities must be same data type"
@@ -328,15 +324,17 @@ def _strain_stress(
         Array of strain rate in x direction (longitudinal) 
     e_yy (np.ndarray | xr.DataArray):
         Array of strain rate in y direction (transverse)
-    e_xy (np.ndarray | xr.DataArray):
-        Array of strain rate in xy direction (shear)
     A (float):
-        Coefficient 'A' for Glen's Flow Law. 
+        Coefficient 'A' for Glen's Flow Law. Defaults to 3.5e-25
 
     Returns:
     --------
-    tau_vm (np.ndarray | xr.DataArray):
-        returns the Von Mises tensile stress in kPa
+    sigma_vm (np.ndarray | xr.DataArray):
+        The Von Mises tensile stress in kPa
+    sigma1 (np.ndarray | xr.DataArray):
+        Principle stress 1 in kPa
+    sigma2 (np.ndarray | xr.DataArray):
+        Principle stress 2 in kPa
     '''
     # Canonical exponent of 3
     n = 3
@@ -377,24 +375,24 @@ def lagrangian_frame(
     -----------
     ds (xr.Dataset):
         dataset containing velocity components
-
     geometry (shapely Polygon):
         polgyon outline of the feature to be tracked
-
     start (int, optional):
         Optional parameter of the starting index. If passed, start from that index.
         Default: 0
-
     reversed (bool):
         calculates original starting place of polygon, then steps forward
-    
     steps (int, optional):
         number of time frames to track the feature. If none, 
         covers all time steps in dataset
-        
     filtersize (int):
         size of window in median filter
         Defaults to 2
+
+    Returns:
+    --------
+    lagrange_frame (xr.Dataset):
+        dataset that follows on the passed polygon as it moves through time
     '''
     # defensive programming
     assert isinstance(ds, xr.Dataset), 'ds must be xr.Dataset'
@@ -420,7 +418,7 @@ def lagrangian_frame(
     # If reversed, find original polygon, then start from beginning
     if reversed:
         end = start - steps
-        
+
         # if the number of steps is greater than the starting index,
         # force a stop at index 0
         if end < 0:
