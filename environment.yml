@@ -1,0 +1,13 @@
+name: ice_fracture_workflow
+channels:
+ - conda-forge
+dependencies:
+ - python=3.12*
+ - jupyterlab
+ - numpy
+ - pandas
+ - matplotlib
+ - imageio
+ - xarray
+ - rioxarray
+ - shapely
