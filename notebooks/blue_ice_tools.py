@@ -366,6 +366,7 @@ def lagrangian_frame(
     reversed: bool = False,
     epsg: int = 3031,
     filtersize: int = 2,
+    remove_threshold = None
 ) -> xr.Dataset:
     '''
     Given an xr.Dataset with velocity components and a shapely Polygon, 
@@ -385,9 +386,12 @@ def lagrangian_frame(
     steps (int, optional):
         number of time frames to track the feature. If none, 
         covers all time steps in dataset
-    filtersize (int):
+    filtersize (int, optional):
         size of window in median filter
         Defaults to 2
+    remove_threshold (float, optional):
+        if you would like to remove values based on the fracture confidence variable,
+        specify the threshold to remove from the next frame
 
     Returns:
     --------
@@ -403,6 +407,8 @@ def lagrangian_frame(
     assert isinstance(start, int), 'Start index must be an Integer'
     assert isinstance(reversed, bool), 'reversed variable must be a boolean'
     assert isinstance(filtersize, int), 'filter size must be an integer'
+    assert isinstance(remove_threshold, (float, NoneType)), \
+        'remove_threshold must be float or None'
 
     # variable initialization
     # If steps passed as none, set steps to length of time dim
@@ -418,7 +424,7 @@ def lagrangian_frame(
     # If reversed, find original polygon, then start from beginning
     if reversed:
         end = start - steps
-
+        
         # if the number of steps is greater than the starting index,
         # force a stop at index 0
         if end < 0:
@@ -431,6 +437,10 @@ def lagrangian_frame(
         start = end
         end += steps
 
+    remove = False
+    if isinstance(remove_threshold, float):
+        remove = True
+
     # Clip original area from first time slice, apply median filter
     gdf = gpd.GeoDataFrame(geometry=[geometry], crs=f'EPSG:{epsg}')
     first_frame = ds.isel(mid_date=start).rio.clip(gdf.geometry, gdf.crs, all_touched=True)
@@ -438,21 +448,19 @@ def lagrangian_frame(
     
     # start list of frames
     clipped_frames = [first_frame]
-    
-    # get all points over an 85% fracture confidence
-    fracture_clip = first_frame.where(first_frame.fracture_conf > .85)
-    
-    # extract points to a list
-    nan_pts = fracture_clip.fracture_conf.stack(points=['x','y'])
-    fracture_points = nan_pts[nan_pts.notnull()].points.data.tolist()
+
+    if remove:
+        # get all points over an 85% fracture confidence
+        fracture_clip = first_frame.where(first_frame.fracture_conf > remove_threshold)
+        
+        # extract points to a list
+        nan_pts = fracture_clip.fracture_conf.stack(points=['x','y'])
+        fracture_points = nan_pts[nan_pts.notnull()].points.data.tolist()
     
     # iterate from start to end index, stepping in the direction specified
     for i in range(start, end):
         # call function to move each point in polygon
         move_points(polygon_points, i, ds)
-        
-        # call function to move points of fracture
-        move_points(fracture_points, i, ds)
         
         # Make a shapely Polgyon of the new points
         geometry = Polygon(polygon_points)
@@ -462,24 +470,28 @@ def lagrangian_frame(
         # clip the next time slice to the moved polygon
         next_frame = ds.isel(mid_date=(i+1)).rio.clip(gdf.geometry, gdf.crs, all_touched=True)
         next_frame = apply_med_filt(next_frame, filtersize)
-    
-        # get all points over and 85% fracture confidence from new frame
-        # must be done before masking with NaN's, or values get lost
-        fracture_clip = next_frame.where(next_frame.fracture_conf > .85)
-    
-        # create x and y list for fracture points
-        x = [pt[0] for pt in fracture_points]
-        y = [pt[1] for pt in fracture_points]
-        for xval, yval in zip(x, y):
-            nearest_point = next_frame.sel(x=xval, y=yval, method='nearest')
-            next_frame.loc[{'x': nearest_point.x.data, 'y': nearest_point.y.data}] = np.nan
+            
+        if remove:
+            # call function to move points of fracture
+            move_points(fracture_points, i, ds)
+            
+            # get all points over and 85% fracture confidence from new frame
+            # must be done before masking with NaN's, or values get lost
+            fracture_clip = next_frame.where(next_frame.fracture_conf > remove_threshold)
         
+            # create x and y list for fracture points
+            x = [pt[0] for pt in fracture_points]
+            y = [pt[1] for pt in fracture_points]
+            for xval, yval in zip(x, y):
+                nearest_point = next_frame.sel(x=xval, y=yval, method='nearest')
+                next_frame.loc[{'x': nearest_point.x.data, 'y': nearest_point.y.data}] = np.nan
+        
+            # extract fractured points to a list
+            nan_pts = fracture_clip.fracture_conf.stack(points=['x','y'])
+            fracture_points = nan_pts[nan_pts.notnull()].points.data.tolist()
+
         clipped_frames.append(next_frame)
         
-        # extract fractured points to a list
-        nan_pts = fracture_clip.fracture_conf.stack(points=['x','y'])
-        fracture_points = nan_pts[nan_pts.notnull()].points.data.tolist()
-    
     lagrange_frame = xr.concat(clipped_frames, dim='mid_date')
     return lagrange_frame
 
