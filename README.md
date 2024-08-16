@@ -14,16 +14,16 @@ The final portion of this framework combines monthly fracture composites produce
 This repository goes increasingly in depth, where the first two notebooks describe the process of loading in the data and computing stresses, both of which are written in as functions and can be called in with one line.
 
 Notebooks Order:
-- access-itslive-data.ipynb
+- 01-access-itslive-data.ipynb
     - Walks through some of the process behind `bit.get_data_cube`
-- derive-strain-rates-stress.ipynb
+- 02-derive-strain-stress.ipynb
     - Walks through the derivation of strain rates, rotation of strain rates along flow and calculating the principle stresses
     - Introduces the function `bit.compute_strain_stress` with an example
-- monthly-stress-analysis.ipynb
+- 03-monthly-stress-analysis.ipynb
     - Walks through light analysis of Principle and Von Mises stresses on monthly timesteps
     - Introduces seasonality utilizing Xarray's built in group by functions
-- fracture-map-analysis.ipynb
-    - Introduces Trystan Surawy-Stepeny's monthly fracture composites
+- 04-fracture-map-analysis.ipynb
+    - Introduces Trystan Surawy-Stepney's monthly fracture composites
     - Shows tracking of crevasse features as they move through space and time.
 
 ## Summary of Results
