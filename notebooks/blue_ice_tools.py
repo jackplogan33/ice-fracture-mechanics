@@ -302,7 +302,7 @@ def compute_strain_stress(
     # Call fcn that computes stress tensor
     sigma_vm, sigma1, sigma2 = _strain_stress(eps_eff, eps_xx, eps_yy)
 
-    return (eps_eff, eps_xx, eps_yy, sigma_vm, sigma1, sigma2)
+    return eps_eff, eps_xx, eps_yy, sigma_vm, sigma1, sigma2
 
 ##################################################################################
 
@@ -361,9 +361,9 @@ def _strain_stress(
 def lagrangian_frame(
     ds: xr.Dataset, 
     geometry: shapely.geometry.polygon.Polygon, 
-    start: int = 0,
-    steps: int = None,
-    reversed: bool = False,
+    start_index: int = 0,
+    steps_forward: int = None,
+    steps_reverse: int = None,
     epsg: int = 3031,
     filtersize: int = 2,
     remove_threshold = None
@@ -402,68 +402,66 @@ def lagrangian_frame(
     assert isinstance(ds, xr.Dataset), 'ds must be xr.Dataset'
     assert isinstance(geometry, shapely.geometry.polygon.Polygon), \
         'geometry must be a shapely polygon'
-    assert isinstance(steps, (NoneType, int)), 'steps must be None or integer'
     assert isinstance(epsg, int), 'EPSG must be an integer'
-    assert isinstance(start, int), 'Start index must be an Integer'
-    assert isinstance(reversed, bool), 'reversed variable must be a boolean'
+    assert isinstance(start_index, int), 'Start index must be an Integer'
+    assert isinstance(steps_forward, (NoneType, int)), \
+        'Number of steps forward must be None or integer'
+    assert isinstance(steps_reverse, (NoneType, int)), \
+        'Number of steps in reverse must be None or int'
     assert isinstance(filtersize, int), 'filter size must be an integer'
     assert isinstance(remove_threshold, (float, NoneType)), \
         'remove_threshold must be float or None'
-
+    
     # variable initialization
-    # If steps passed as none, set steps to length of time dim
-    if isinstance(steps, NoneType):
-        steps = len(ds.mid_date) - 1
+    # If steps not passed, set end index to last timestep
+    if isinstance(steps_forward, NoneType):
+        end = len(ds.mid_date)
         
-    # end variable (start index + number of steps)
-    end = start + steps
+    # If steps passed, set end index to starting index + num of steps
+    else:      
+        end = start_index + steps_forward
+    
+    if end > len(ds.mid_date):
+        end = len(ds.mid_date)
     
     # get list of points from polygon
-    polygon_points = list(geometry.exterior.coords)
-
-    # If reversed, find original polygon, then start from beginning
-    if reversed:
-        end = start - steps
+    xs, ys = np.array(geometry.exterior.coords).T
         
-        # if the number of steps is greater than the starting index,
-        # force a stop at index 0
-        if end < 0:
-            end = 0
-        
-        for i in range(start, end, -1):
-            move_points(polygon_points, i, ds, reversed=True)
+    # If reversed steps given, move polygon backwards to beginning timestep
+    if isinstance(steps_reverse, int): 
+        for i in range(steps_reverse):
+            move_points(xs, ys, (start_index-i), ds, reversed=True)
             
-        geometry = Polygon(polygon_points)
-        start = end
-        end += steps
-
-    remove = False
-    if isinstance(remove_threshold, float):
-        remove = True
-
+        # Create original polygon, subtract reversed indexes from starting index
+        geometry = Polygon(np.array([xs, ys]).T)
+        start_index -= steps_reverse
+    
+    # Set remove to False if None, True if value passed
+    remove = False if isinstance(remove_threshold, NoneType) else True
+    
     # Clip original area from first time slice, apply median filter
     gdf = gpd.GeoDataFrame(geometry=[geometry], crs=f'EPSG:{epsg}')
-    first_frame = ds.isel(mid_date=start).rio.clip(gdf.geometry, gdf.crs, all_touched=True)
+    first_frame = ds.isel(mid_date=start_index).rio.clip(gdf.geometry, gdf.crs, all_touched=True)
     first_frame = apply_med_filt(first_frame, filtersize)
     
-    # start list of frames
+    # initialize list of frames, add first frame to that
     clipped_frames = [first_frame]
-
+    
+    # If removing values, get all points above threshold
     if remove:
-        # get all points over an 85% fracture confidence
         fracture_clip = first_frame.where(first_frame.fracture_conf > remove_threshold)
         
-        # extract points to a list
+        # extract points to x and y arrays
         nan_pts = fracture_clip.fracture_conf.stack(points=['x','y'])
-        fracture_points = nan_pts[nan_pts.notnull()].points.data.tolist()
+        xs_f, ys_f = nan_pts[nan_pts.notnull()].x.data, nan_pts[nan_pts.notnull()].y.data
     
     # iterate from start to end index, stepping in the direction specified
-    for i in range(start, end):
+    for i in range(start_index, end):
         # call function to move each point in polygon
-        move_points(polygon_points, i, ds)
+        move_points(xs, ys, i, ds)
         
         # Make a shapely Polgyon of the new points
-        geometry = Polygon(polygon_points)
+        geometry = Polygon(np.array([xs, ys]).T)
         # make GDF of the polgyon
         gdf = gpd.GeoDataFrame(geometry=[geometry], crs=f'EPSG:{epsg}')
         
@@ -473,23 +471,20 @@ def lagrangian_frame(
             
         if remove:
             # call function to move points of fracture
-            move_points(fracture_points, i, ds)
+            move_points(xs_f, ys_f, i, ds)
             
             # get all points over and 85% fracture confidence from new frame
             # must be done before masking with NaN's, or values get lost
             fracture_clip = next_frame.where(next_frame.fracture_conf > remove_threshold)
         
-            # create x and y list for fracture points
-            x = [pt[0] for pt in fracture_points]
-            y = [pt[1] for pt in fracture_points]
-            for xval, yval in zip(x, y):
+            for xval, yval in zip(xs_f, ys_f):
                 nearest_point = next_frame.sel(x=xval, y=yval, method='nearest')
                 next_frame.loc[{'x': nearest_point.x.data, 'y': nearest_point.y.data}] = np.nan
         
             # extract fractured points to a list
             nan_pts = fracture_clip.fracture_conf.stack(points=['x','y'])
-            fracture_points = nan_pts[nan_pts.notnull()].points.data.tolist()
-
+            xs_f, ys_f = nan_pts[nan_pts.notnull()].x.data, nan_pts[nan_pts.notnull()].y.data
+    
         clipped_frames.append(next_frame)
         
     lagrange_frame = xr.concat(clipped_frames, dim='mid_date')
@@ -497,18 +492,109 @@ def lagrangian_frame(
 
 ##################################################################################
 
-def move_points(points, index, ds, reversed=False):
-    for i, point in enumerate(points):
-        # unpack point into x, y
-        # unpack point into x, y
-        x, y = point
+def parcel_strain_stress(
+    ds: xr.Dataset, 
+    x: (int | float),
+    y: (int | float),
+    buffer: (int | float) = 0,
+    start_index: '(int, optional)' = None,
+    steps_forward: '(int, optional)' = None, 
+    steps_reverse: '(int, optional)' = None
+) -> xr.Dataset:
+    '''
+    Returns the time series values of a single point as it moves
+    across the domain with time. It integrates the strain rate to
+    calculate the strain of a parcel and adds as new variables to the dataset
+
+    Parameters:
+    -----------
+    ds : xr.Dataset
+        xarray dataset to be passed to move_points function. Must have x- and y-velocity,
+        effective, x, and y strain rates.
+    x : (int, float)
+        Integer or float value of the x-coordinate of the point of interest
+    y : (int, float)
+        integer or float value of the x-coordinate of the point of intetest
+    buffer : (int, float, optional)
+        integer or float amount of distance to average around the point of interest
+    
+    '''
+    assert isinstance(ds, xr.Dataset), 'da must be a DataArray'
+    assert type(x) == type(y), 'x and y must be the same type'
+    assert isinstance(x, (int, float)), 'x- and y-points must be list or numpy array'
+    assert isinstance(start_index, (int, NoneType)), 'Starting index must be an int or None'
+    assert isinstance(steps_forward, (int, NoneType)), 'Steps forward must be an int or None'
+    assert isinstance(steps_forward, (int, NoneType)), 'Steps reverse must be an int or None'
+    assert isinstance(buffer, int)
+    x = [x]
+    y = [y]
+    
+    # Add initial pt to forward step
+    x_forward = [x[0]]
+    y_forward = [y[0]]
+    for i in range(steps_forward):
+        move_points(x, y, (start_index+i), ds)
+        x_forward.append(x[0])
+        y_forward.append(y[0])
+    
+    # Initialize list for points in reverse
+    x_reverse = []
+    y_reverse = []
+    for i in range(steps_reverse+1):
+        move_points(x, y, (start_index-i), ds, reversed=True)
+        x_reverse.append(x[0])
+        y_reverse.append(y[0])
+    
+    # Make full list of x values in increasing order
+    xs = x_reverse[::-1] + x_forward
+    ys = y_reverse[::-1] + y_forward
+
+    # Initialize list for selection of dfs for each point
+    point_vals = []
+    
+    for i in range((steps_forward + steps_reverse)+1):
+        xx = xs[i]
+        yy = ys[i]
         
+        parcel = ds.sel(x=slice(xx-buffer, xx+buffer), y=slice(yy-buffer, yy+buffer)).mean(['x','y'])
+        point_vals.append(parcel.isel(mid_date=i))
+    
+    point_srs = xr.concat(point_vals, dim='mid_date')
+    strain = point_srs[['eps_eff', 'eps_xx', 'eps_yy']].cumsum(dim='mid_date')
+    strain = strain.rename_vars({'eps_eff':'e_eff', 'eps_xx':'e_xx', 'eps_yy':'e_yy'})
+    
+    return xr.merge([point_srs, strain])
+
+##################################################################################
+
+def move_points(
+    xs: (list | np.ndarray),
+    ys: (list | np.ndarray), 
+    index: (int), 
+    ds: xr.Dataset,
+    reversed: bool = False
+):
+    '''
+    Given x- and y- coordinates, a time index, and a dataset with
+    x- and y-velocities moves the points to the location they would be
+    after one month. Velocity in m/yr, coordinates in meters.
+    '''
+    assert type(xs) == type(ys), 'xs and ys must have the same type'
+    assert isinstance(xs, (list, np.ndarray)), 'xs and ys must be a list or numpy array'
+    assert len(xs) == len(ys), 'Number of x and y coordinates should be equal'
+    assert all([isinstance(x, (int, float)) for x in xs]), 'all xs must be int or float values'
+    assert all([isinstance(y, (int, float)) for y in ys]), 'all ys must be int or float values'
+    assert isinstance(index, int), 'index must be and integer'
+    assert isinstance(ds, xr.Dataset), 'ds must be an xarray Dataarray'
+    assert isinstance(reversed, bool), 'reversed must be a boolean'
+    
+    for i, (x, y) in enumerate(zip(xs, ys)):
         # if REVERSE:
         # Get velocities from previous timestep
         # make negative
         if reversed:
-            vx = ds.vx[(index-1)].sel(x=x, y=y, method='nearest').data
-            vy = ds.vy[(index-1)].sel(x=x, y=y, method='nearest').data
+            vx = ds.vx[index-1].sel(x=x, y=y, method='nearest').data
+            vy = ds.vy[index-1].sel(x=x, y=y, method='nearest').data
             vx = vx * -1
             vy = vy * -1
         
@@ -517,23 +603,15 @@ def move_points(points, index, ds, reversed=False):
             # get x and y velocity for the coordinate pt
             vx = ds.vx[index].sel(x=x, y=y, method='nearest').data
             vy = ds.vy[index].sel(x=x, y=y, method='nearest').data
-        
-        # If values are NaN, make that vel zero
+            
         if np.isnan(vx):
             vx = 0
         if np.isnan(vy):
             vy = 0
         
         # add amt of distance travelled over the month
-        dx = (vx / 12)
-        dy = (vy / 12)
-        
-        x += dx
-        y += dy
-        
-        # repack coords as tuple, assign to index
-        # in points list
-        points[i] = (x,y)
+        xs[i] += (vx / 12)
+        ys[i] += (vy / 12)
 
 ##################################################################################
 
