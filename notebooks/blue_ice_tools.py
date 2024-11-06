@@ -115,6 +115,7 @@ def get_data_cube(
     shape: gpd.GeoDataFrame = None, 
     urls: tuple | list | np.ndarray = None, 
     epsg: int = 3031,
+    dt_delta: int = 19,
     engine: str = 'zarr'
 ):
     '''
@@ -134,13 +135,18 @@ def get_data_cube(
         Defaults to None
     epsg (int, optional):
         epsg number of the CRS used in shape
-
+    dt_delta (int, optional) :
+        Maximum time difference, in days, between image pairs. Equivalent to the time widget on ITS_LIVE.
+        Default to 19
     Returns:
     --------
     dc ()
     '''
     # Type errors
     assert isinstance(shape, (gpd.GeoDataFrame, NoneType)), "Shape must be type gpd.GeoDataFrame or be None"
+    assert isinstance(epsg, int), "EPSG must be of type int"
+    assert isinstance(dt_delta, int), "dt_delta must be an int value"
+    assert isinstance(engine, str), "engine must be of type str"
     
     if isinstance(shape, gpd.GeoDataFrame):
         assert shape.crs, "shape must have a CRS attribute"
@@ -148,9 +154,6 @@ def get_data_cube(
 
     else:
         gdf = False
-
-    assert isinstance(epsg, int), "EPSG must be of type int"
-    assert isinstance(engine, str), "engine must be of type str"
     
     # if not given urls, get urls
     if urls == None:
@@ -166,7 +169,7 @@ def get_data_cube(
     
     # Use partial function to pass shape to the preprocessing function
     # From xr.open_mfdataset documentation
-    preprocess = partial(_preprocess, shape=shape, epsg=epsg, gdf=gdf)
+    preprocess = partial(_preprocess, shape=shape, epsg=epsg, gdf=gdf, dt_delta=dt_delta)
 
     # opens multiple datasets. Chunks time=-1 to make sortby easier
     dc = xr.open_mfdataset(urls, engine=engine, preprocess=preprocess, 
@@ -178,7 +181,13 @@ def get_data_cube(
 
 ##################################################################################
 
-def _preprocess(ds, shape, epsg, gdf):
+def _preprocess(
+    ds: xr.Dataset,
+    shape: gpd.GeoDataFrame, 
+    epsg: str, 
+    gdf: bool, 
+    dt_delta: int
+):
     '''
     Preprocessing function for xr.open_mfdataset is as follows:
         - Refines datasets to only the x- and y-velocities, and their corresponding errors.
@@ -187,12 +196,14 @@ def _preprocess(ds, shape, epsg, gdf):
         - Sorts datasets by mid_date because the ITSLIVE data cubes are out of order, which
         allows open_mfdataset to concatenate along time dimension. 
     '''
-    # Data variables to be used in blue ice zone calculations
-    data_vars = ['v', 'vx', 'vy']
-    ds = ds[data_vars]
+    # Convert time in days to nanoseconds
+    ns = dt_delta * 86400000000000
     
-    # clip to 2015-present
-    ds = ds.where(ds.mid_date.dt.year >= 2015, drop=True)
+    # Data variables to be used in blue ice zone calculations
+    T = np.array(ns, dtype='timedelta64[ns]')
+    
+    # clip to images that have a time delta less than 19 days
+    ds = ds[['vx','vy','v']].where(ds.date_dt <= T)
 
     if gdf:
         # Write CRS to data and clip to blue ice regions geometry
@@ -202,7 +213,7 @@ def _preprocess(ds, shape, epsg, gdf):
     # Sort by time variable
     ds = ds.sortby('mid_date')
     return ds
-    
+
 ##################################################################################
 
 def compute_strain_stress(
@@ -517,53 +528,113 @@ def parcel_strain_stress(
         integer or float value of the x-coordinate of the point of intetest
     buffer : (int, float, optional)
         integer or float amount of distance to average around the point of interest
-    
+    start_index : (int, optional)
+        Time index of the x- and y-coordinates given. If none passed, start index of 0 is assumed.
+        Gives flexibility of where and when a point can be tracked
+    steps_forward : (int, optional)
+        Number of timesteps to take in the forward time direction. If none passed, will step as many indexes
+        are available in the time index
+    steps_reverse : (int, optional)
+        Number of timesteps to take in the reverse time direction. If non passed, 0 is assumed.
+        Allows the tracking of points identfied as crevassed in the middle of a time series before they broke.
+
+    Returns:
+    --------
+    parcel (ds) :
+        xarray dataset with time variable remaining. Appends total effective, x-, and y-direction strains
+    xs (list) :
+        list of x-coordinates in order from the first to last timestep
+    ys (list) : 
+        list of y-coordinates in order from the first to last timestep
     '''
     assert isinstance(ds, xr.Dataset), 'da must be a DataArray'
     assert type(x) == type(y), 'x and y must be the same type'
-    assert isinstance(x, (int, float)), 'x- and y-points must be list or numpy array'
+    assert isinstance(x, (int, float)), 'x- and y-points must be int or float'
     assert isinstance(start_index, (int, NoneType)), 'Starting index must be an int or None'
     assert isinstance(steps_forward, (int, NoneType)), 'Steps forward must be an int or None'
     assert isinstance(steps_forward, (int, NoneType)), 'Steps reverse must be an int or None'
     assert isinstance(buffer, int)
-    x = [x]
-    y = [y]
+    
+    # Initialize variable, ensure indexing works
+    # Grab length of time index
+    length = len(ds.mid_date)
+    
+    # If start index not given, 
+    if isinstance(start_index, NoneType):
+        start_index = 0
+        steps_reverse = 0
+    
+    else:
+        # If start index given, check that the index is less than number of timesteps
+        assert start_index < length, \
+            "Starting index must be at least 1 less than the mid_date length"
+    
+    # If steps forward not given, go as many steps forward as possible
+    if isinstance(steps_forward, NoneType):
+        steps_forward = length - start_index
+        
+    else:
+        final_step = steps_forward + start_index
+        # If steps forward given
+        assert final_step <= len(ds.mid_date), \
+            "Too many steps forward. Decrease the number of timesteps"
+    
+    # If no steps reversed given, set to 0
+    if isinstance(steps_reverse, NoneType):
+        steps_reverse = 0
+    
+    else:
+        first_step = start_index - steps_reverse
+        assert first_step >= 0, "Too many steps reverse. Decrease the number of timesteps"
+    
+    # Define start and end index
+    first_step = start_index - steps_reverse
+    final_step = start_index + steps_forward
+    
+    # Define x- and y-arrays for move_points func
+    move_x = [x]
+    move_y = [y]
     
     # Add initial pt to forward step
-    x_forward = [x[0]]
-    y_forward = [y[0]]
+    x_forward = [move_x[0]]
+    y_forward = [move_y[0]]
     for i in range(steps_forward):
-        move_points(x, y, (start_index+i), ds)
-        x_forward.append(x[0])
-        y_forward.append(y[0])
+        move_points(move_x, move_y, (start_index+i), ds)
+        x_forward.append(move_x[0])
+        y_forward.append(move_y[0])
+    
+    move_x = [x]
+    move_y = [y]
     
     # Initialize list for points in reverse
     x_reverse = []
     y_reverse = []
-    for i in range(steps_reverse+1):
-        move_points(x, y, (start_index-i), ds, reversed=True)
-        x_reverse.append(x[0])
-        y_reverse.append(y[0])
+    for i in range(steps_reverse):
+        move_points(move_x, move_y, (start_index-i), ds, reversed=True)
+        x_reverse.append(move_x[0])
+        y_reverse.append(move_y[0])
     
     # Make full list of x values in increasing order
     xs = x_reverse[::-1] + x_forward
     ys = y_reverse[::-1] + y_forward
-
+    
     # Initialize list for selection of dfs for each point
     point_vals = []
     
-    for i in range((steps_forward + steps_reverse)+1):
+    for i, time_index in enumerate(range(first_step, final_step)):
         xx = xs[i]
         yy = ys[i]
         
-        parcel = ds.sel(x=slice(xx-buffer, xx+buffer), y=slice(yy-buffer, yy+buffer)).mean(['x','y'])
-        point_vals.append(parcel.isel(mid_date=i))
+        parcel = ds.sel(x=slice(xx-buffer, xx+buffer), y=slice(yy-buffer, yy+buffer)).mean(['x','y'], skipna=True)
+        point_vals.append(parcel.isel(mid_date=time_index))
     
     point_srs = xr.concat(point_vals, dim='mid_date')
     strain = point_srs[['eps_eff', 'eps_xx', 'eps_yy']].cumsum(dim='mid_date')
     strain = strain.rename_vars({'eps_eff':'e_eff', 'eps_xx':'e_xx', 'eps_yy':'e_yy'})
-    
-    return xr.merge([point_srs, strain])
+        
+    parcel = xr.merge([point_srs, strain])
+
+    return parcel, xs, ys
 
 ##################################################################################
 
