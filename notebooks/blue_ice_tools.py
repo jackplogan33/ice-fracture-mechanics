@@ -467,7 +467,7 @@ def lagrangian_frame(
         xs_f, ys_f = nan_pts[nan_pts.notnull()].x.data, nan_pts[nan_pts.notnull()].y.data
     
     # iterate from start to end index, stepping in the direction specified
-    for i in range(start_index, end):
+    for i in range(start_index, (end-1)):
         # call function to move each point in polygon
         move_points(xs, ys, i, ds)
         
