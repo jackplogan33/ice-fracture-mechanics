@@ -3,686 +3,892 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 import rioxarray as rxr
+import matplotlib.pyplot as plt
 from functools import partial
 
+from scipy.signal import savgol_filter as sg
+from tqdm import tqdm
+
 from shapely.geometry import Polygon
+from shapely.geometry import Point
 from scipy import ndimage
 import shapely.geometry
 
-import matplotlib.pyplot as plt
-from types import NoneType
 import dask
 dask.config.set(**{'array.slicing.split_large_chunks': False})
-
-import itslivetools
 
 ##################################################################################
 
 def get_urls(
-    area: gpd.GeoDataFrame | tuple | list = None,  
-    epsg: int=3031
+    shape: gpd.GeoDataFrame = None,
+    points: list | tuple = None,
+    epsg: int = 3031
 ) -> list:
-    '''
-    Given a GDF area or a point in EPSG:4326, return URL or list of URLs
-    that cover the area or point of areas.
+    """
+    Retrieve URLs from the ITS_LIVE catalog that intersect with a given GeoDataFrame or set of points.
 
     Parameters
     ----------
-    area (gpd.GeoDataFrame | tuple | list, optional):
-        GeoDataFrame of the reference area, a singular point as a list or tuple,
-        or a list or tuple of points. Points should be passed as (lon, lat).
-        If none are passed, all URLs from the specified EPSG number will be returned
-    epsg (int, optional):
-        If area is GeoDataFrame, value must be same as the CRS of the gdf. 
-        If area is none, returns all URLs from the EPSG number passed.
-        Default: 3031
+    shape : gpd.GeoDataFrame, optional
+        A GeoDataFrame specifying the region of interest in a given CRS.
+    points : list or tuple, optional
+        A point (lon, lat) or a list of points [(lon, lat), (lon, lat), ...].
+    epsg : int, optional
+        EPSG code used for filtering or projecting the GeoDataFrame. Default is 3031.
 
     Returns
     -------
-    urls:
-        list of data cube URLs from ITS_LIVE catalog
-    '''
-    # sanitize inputs, raise errors: 
-    assert isinstance(area, (tuple, list, gpd.GeoDataFrame, NoneType)), "area must be a tuple, list, or GeoDataFrame"
-    assert isinstance(epsg, int), "epsg must be and integer value"
-    
-    if isinstance(area, gpd.GeoDataFrame):
-        # If the area is a geodataframe, point var is false
-        point = False
-        gdf = True
-        # ensures area is in proper CRS
-        area = area.to_crs(epsg)
+    list
+        Unique ITS_LIVE data cube URLs intersecting the specified geometry or EPSG code.
 
-    elif isinstance(area, (list, tuple)):
-        # if the area is a list or tuple, point var is true
-        point = True
+    Raises
+    ------
+    TypeError
+        If `epsg` is not an integer, or if inputs are not of expected types.
+    ValueError
+        If the `shape` does not have a defined CRS, or `points` are not properly formatted.
 
-        # Check for multiple points by  seeing if first entry is number or tuple/list
-        # also check for proper length of points        
-        if all(isinstance(entry, (int, float)) for entry in area) & (len(area) == 2):
-            # singular point, set multi as false
-            multi = False
-        
-        elif all(isinstance(entry, (list, tuple)) for entry in area):
-            assert all((len(entry) == 2) for entry in area), \
-                "To pass multiple points, format area such that ((lon,lat), (lon,lat), ...)"
-            
-            # multiple points, set multi as true
-            multi = True
+    Notes
+    -----
+    - If both `shape` and `points` are None, the function returns URLs filtered by the EPSG code.
+    - Points are expected in (lon, lat) format.
+
+    Examples
+    --------
+    >>> from shapely.geometry import Polygon
+    >>> import geopandas as gpd
+    >>> polygon = Polygon([(-60, -60), (-60, -61), (-61, -61), (-61, -60), (-60, -60)])
+    >>> gdf = gpd.GeoDataFrame(geometry=[polygon], crs='EPSG:4326')
+    >>> urls = get_urls(shape=gdf)
+    >>> print(urls)
+    """
+    # Input validation
+    if not isinstance(epsg, int):
+        raise TypeError("epsg must be an integer.")
+
+    if shape is not None:
+        if not isinstance(shape, gpd.GeoDataFrame):
+            raise TypeError("Shape must be a GeoDataFrame.")
+        if shape.crs is None:
+            raise ValueError("Shape GeoDataFrame must have a CRS defined.")
+    elif points is not None:
+        if isinstance(points, (list, tuple)):
+            # Handle single point
+            if all(isinstance(coord, (int, float)) for coord in points) and len(points) == 2:
+                points = [points]
+            # Handle multiple points
+            elif all(isinstance(pt, (list, tuple)) and len(pt) == 2 for pt in points):
+                pass  # Already a list of points
+            else:
+                raise ValueError("Points must be in the format [(lon, lat), (lon, lat), ...] or (lon, lat).")
         else:
-            # point passed is not valid, raise error
-            raise ValueError(
-                "Point not in correct format. Must be passed as (lon, lat), or ((lon,lat),(lon,lat), ...)"
-            )
+            raise TypeError("Points must be a list, tuple, or None.")
     else:
-        gdf = False
-        point = False
+        shape, points = None, None  # Default case
 
-    # if the area passed is a point
-    if point:
-        # 
-        if multi:
-            urls = [itslivetools.find_granule_by_point(pt) for pt in area]
+    # Load ITS_LIVE catalog
+    catalog_url = 'https://its-live-data.s3.amazonaws.com/datacubes/catalog_v02.json'
+    catalog = gpd.read_file(catalog_url)
 
-        else:
-            # use itslivetools 
-            urls = [itslivetools.find_granule_by_point(area)]
+    # Logic for points input
+    if points:
+        # Convert points to a GeoDataFrame
+        geometry = [Point(lon, lat) for lon, lat in points]
+        points_gdf = gpd.GeoDataFrame(geometry=geometry, crs='EPSG:4326')
 
-        return urls
-    
-    # is area passed is a GeoDataFrame
-    elif gdf:
-        # Read in ITSLIVE json catalog, and write to crs
-        catalog = gpd.read_file('https://its-live-data.s3.amazonaws.com/datacubes/catalog_v02.json')
-        catalog = catalog.to_crs(f'EPSG:{epsg}')
+        # Perform spatial join
+        catalog_sub = catalog.sjoin(points_gdf, how='inner')
 
-        # Use a spatial join to match URLs of the catalog to the shapes in the shapefile
-        catalog_sub = gpd.sjoin(area, catalog, how='inner')
-    
-        # Get list of unique datacube urls
-        urls = catalog_sub.drop_duplicates('zarr_url').zarr_url.values.tolist()
-        return urls
+    # Logic for GeoDataFrame input
+    elif shape is not None:
+        shape = shape.to_crs(epsg)  # Reproject to specified EPSG
+        catalog = catalog.to_crs(epsg)
+        catalog_sub = gpd.sjoin(shape, catalog, how='inner')
 
+    # Default case: return all URLs for the given EPSG
     else:
-        catalog = gpd.read_file('https://its-live-data.s3.amazonaws.com/datacubes/catalog_v02.json')
         catalog_sub = catalog[catalog['epsg'] == epsg]
-        urls = catalog_sub.drop_duplicates('zarr_url').zarr_url.values.tolist()
-        return urls
+
+    # Extract unique URLs
+    urls = catalog_sub['zarr_url'].drop_duplicates().tolist()
+    return urls
 
 ##################################################################################
 
 def get_data_cube(
     shape: gpd.GeoDataFrame = None, 
-    urls: tuple | list | np.ndarray = None, 
+    urls: list | tuple | np.ndarray = None, 
     epsg: int = 3031,
-    dt_delta: int = 19,
+    dt_delta: int = None,
     engine: str = 'zarr'
-):
-    '''
-    Given a geometry vector, will call the get_urls function to download
-    ITSLIVE velocity zarr cubes into xarray, clip each cube to the passed geometry,
-    concatenate into one datacube, and resample by month.
-    
-    If given a list of urls, get_urls() is not called.
+) -> xr.Dataset:
+    """
+    Download and process ITS_LIVE velocity data cubes, optionally clipping them to a specified geometry.
 
-    Parameters:
-    -----------
-    shape (gpd.GeoDataFrame, optional):
-        GeoDataFrame of shape to clip the datacubes. If not passed, datacubes will be returned in full
-    urls (tuple | list | np.ndarray, optional):
-        If none, calls get_urls function for the shapefile/EPSG. If urls are passed, 
-        skips function and opens files from given list. Must all be of same engine.
-        Defaults to None
-    epsg (int, optional):
-        epsg number of the CRS used in shape
-    dt_delta (int, optional) :
-        Maximum time difference, in days, between image pairs. Equivalent to the time widget on ITS_LIVE.
-        Default to 19
-    Returns:
+    Parameters
+    ----------
+    shape : gpd.GeoDataFrame, optional
+        GeoDataFrame defining the region of interest, with a defined CRS.
+    urls : list, tuple, or np.ndarray, optional
+        URLs of ITS_LIVE data cubes. If not provided, `get_urls` is used with the `shape` and `epsg` parameters.
+    epsg : int, optional
+        EPSG code for the CRS. Defaults to 3031.
+    dt_delta : int, optional
+        Maximum allowed time difference (in days) for image pairs. Default is None (no filtering).
+    engine : str, optional
+        Engine used for reading Zarr files. Defaults to 'zarr'.
+
+    Returns
+    -------
+    xr.Dataset
+        Concatenated and resampled xarray Dataset representing the velocity data.
+
+    Raises
+    ------
+    TypeError
+        If inputs are not of the expected types.
+    ValueError
+        If `shape` does not have a defined CRS.
+
+    Notes
+    -----
+    - Data cubes are resampled to monthly intervals using the mean.
+    - Input URLs must correspond to valid ITS_LIVE data cubes.
+
+    Examples
     --------
-    dc ()
-    '''
-    # Type errors
-    assert isinstance(shape, (gpd.GeoDataFrame, NoneType)), "Shape must be type gpd.GeoDataFrame or be None"
-    assert isinstance(epsg, int), "EPSG must be of type int"
-    assert isinstance(dt_delta, int), "dt_delta must be an int value"
-    assert isinstance(engine, str), "engine must be of type str"
-    
-    if isinstance(shape, gpd.GeoDataFrame):
-        assert shape.crs, "shape must have a CRS attribute"
-        gdf = True
+    >>> from shapely.geometry import Polygon
+    >>> import geopandas as gpd
+    >>> polygon = Polygon([(-60, -60), (-60, -61), (-61, -61), (-61, -60), (-60, -60)])
+    >>> gdf = gpd.GeoDataFrame(geometry=[polygon], crs='EPSG:4326')
+    >>> dataset = get_data_cube(shape=gdf)
+    >>> print(dataset)
+    """
+    # Validate inputs
+    if not isinstance(epsg, int):
+        raise TypeError("EPSG must be an integer.")
+    if dt_delta is not None and not isinstance(dt_delta, int):
+        raise TypeError("dt_delta must be an integer or None.")
+    if not isinstance(engine, str):
+        raise TypeError("engine must be a string.")
+    if shape is not None:
+        if not isinstance(shape, gpd.GeoDataFrame):
+            raise TypeError("Shape must be a GeoDataFrame or None.")
+        if shape.crs is None:
+            raise ValueError("Shape GeoDataFrame must have a CRS defined.")
 
-    else:
-        gdf = False
-    
-    # if not given urls, get urls
-    if urls == None:
+    # Get URLs if not provided
+    if urls is None:
         urls = get_urls(shape, epsg=epsg)
-        
-    # if given urls, check type
     else:
-        assert isinstance(urls, (tuple, list, np.ndarray)), "URLs must be passed as list, tuple, or array"
-        assert all(isinstance(url, str) for url in urls), "Each item in urls must be a string"
-        
-    # chunks to pass to
-    chunks = {'mid_date':-1, 'x':'auto', 'y':'auto'}
-    
-    # Use partial function to pass shape to the preprocessing function
-    # From xr.open_mfdataset documentation
-    preprocess = partial(_preprocess, shape=shape, epsg=epsg, gdf=gdf, dt_delta=dt_delta)
+        if not isinstance(urls, (list, tuple, np.ndarray)):
+            raise TypeError("URLs must be a list, tuple, or numpy array.")
+        if not all(isinstance(url, str) for url in urls):
+            raise ValueError("All items in URLs must be strings.")
 
-    # opens multiple datasets. Chunks time=-1 to make sortby easier
-    dc = xr.open_mfdataset(urls, engine=engine, preprocess=preprocess, 
-                           chunks=chunks, combine='nested', concat_dim='mid_date').chunk(mid_date=-1)
-    
-    # sort by mid_date, resample by month, taking mean per month
-    dc = dc.sortby('mid_date').resample(mid_date='1ME').mean(dim='mid_date', skipna=True).chunk('auto')
+    # Set chunking and preprocessing parameters
+    chunks = {'mid_date': -1, 'x': 'auto', 'y': 'auto'}
+    preprocess = partial(_preprocess, shape=shape, epsg=epsg, dt_delta=dt_delta)
+
+    # Open datasets and process
+    dc = xr.open_mfdataset(
+        urls,
+        engine=engine,
+        preprocess=preprocess,
+        chunks=chunks,
+        combine='nested',
+        concat_dim='mid_date'
+    )
+
+    # Sort and resample data
+    dc = (
+        dc.sortby('mid_date')
+        .resample(mid_date='1ME')  # '1ME' means month-end frequency
+        .mean(dim='mid_date', skipna=True)
+        .chunk('auto')
+    )
+
     return dc
 
 ##################################################################################
 
 def _preprocess(
     ds: xr.Dataset,
-    shape: gpd.GeoDataFrame, 
-    epsg: str, 
-    gdf: bool, 
-    dt_delta: int
-):
-    '''
-    Preprocessing function for xr.open_mfdataset is as follows:
-        - Refines datasets to only the x- and y-velocities, and their corresponding errors.
-        - Shortens timespan to 2015-present, where coverage is more consistent
-        - Clip data to blue ice regions using rioxarray
-        - Sorts datasets by mid_date because the ITSLIVE data cubes are out of order, which
-        allows open_mfdataset to concatenate along time dimension. 
-    '''
-    # Convert time in days to nanoseconds
-    ns = dt_delta * 86400000000000
-    
-    # Data variables to be used in blue ice zone calculations
-    T = np.array(ns, dtype='timedelta64[ns]')
-    
-    # clip to images that have a time delta less than 19 days
-    ds = ds[['vx','vy','v']].where(ds.date_dt <= T)
+    shape: gpd.GeoDataFrame = None, 
+    epsg: int = 3031,
+    dt_delta: int = None,
+) -> xr.Dataset:
+    """
+    Preprocess ITS_LIVE velocity data cubes before concatenation.
 
-    if gdf:
-        # Write CRS to data and clip to blue ice regions geometry
-        ds = ds.rio.write_crs(f'EPSG:{epsg}')
+    Steps:
+    - Filter dataset to include specific satellites if specified.
+    - Filter dataset for time delta (if `dt_delta` is set).
+    - Select relevant velocity variables.
+    - Clip data to a GeoDataFrame region (if provided).
+    - Sort by 'mid_date'.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Input xarray dataset to preprocess.
+    shape : gpd.GeoDataFrame, optional
+        GeoDataFrame for spatial clipping.
+    epsg : int, optional
+        EPSG code for the CRS. Defaults to 3031.
+    dt_delta : int, optional
+        Maximum allowed time difference (in days) for image pairs. If None, no filtering is applied.
+
+    Returns
+    -------
+    xr.Dataset
+        Preprocessed xarray Dataset.
+    """
+    ## TODO: 
+    ## add selection by date
+    ## figure out single satellite selection
+    
+    # Select relevant velocity variables
+    ds = ds[['vx', 'vy', 'v']]
+
+    # Filter by time delta if dt_delta is specified
+    if dt_delta is not None:
+        time_threshold_ns = np.timedelta64(dt_delta, 'D')
+        ds = ds.where(ds.date_dt <= time_threshold_ns)
+
+    # Clip to GeoDataFrame if provided
+    if shape is not None:
+        ds = ds.rio.write_crs(f"EPSG:{epsg}")
         ds = ds.rio.clip(shape.geometry, shape.crs)
 
-    # Sort by time variable
-    ds = ds.sortby('mid_date')
+    # Sort by mid_date
+    return ds.sortby('mid_date')
+    
+##################################################################################
+
+def compute_strain_stress(
+    ds: xr.Dataset,
+    rotate: bool = False,
+    sav_gol: bool = False,
+    dx: int = 120,
+    dy: int = 120,
+    window_length: int = 11,
+    polyorder: int = 2,
+    deriv: int = 1,
+    n: float = 3,
+    A: float = 3.5e-25
+) -> xr.DataArray | np.ndarray:
+    """
+    Computes strain rates and stresses from velocity fields in an xarray Dataset.
+
+    This function calculates the strain rate tensor and derived stress fields based on
+    the velocity components (`vx`, `vy`) in the input dataset. It supports two methods
+    for calculating gradients: Savitzky-Golay filtering or finite differences. The user
+    can optionally apply tensor rotation to align results with a local coordinate system.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Input dataset containing velocity components `vx` and `vy`.
+    sav_gol : bool, optional
+        If True, use Savitzky-Golay filtering for gradient computation. 
+        If False, use finite differences via xarray's `.differentiate` (default is False).
+    dx : int, optional
+        Spatial resolution in the x-direction (default is 120). Only relevant if `sav_gol` is True.
+    dy : int, optional
+        Spatial resolution in the y-direction (default is 120). Only relevant if `sav_gol` is True.
+    window_length : int, optional
+        Length of the Savitzky-Golay filter window (default is 11). Only relevant if `sav_gol` is True.
+    polyorder : int, optional
+        Polynomial order for the Savitzky-Golay filter (default is 2). Only relevant if `sav_gol` is True.
+    deriv : int, optional
+        Derivative order for the Savitzky-Golay filter (default is 1). Only relevant if `sav_gol` is True.
+    rotate : bool, optional
+        If True, rotates the strain rate tensor to align with local flow direction (default is False).
+    n : float, optional
+        Glen's flow law exponent (default is 3).
+    A : float, optional
+        Temperature-dependent flow law constant (default is 3.5e-25).
+
+    Returns
+    -------
+    xr.Dataset
+        The input dataset with additional variables:
+        - `effective`: Effective strain rate.
+        - `eps_xx`: Strain rate tensor component xx.
+        - `eps_yy`: Strain rate tensor component yy.
+        - `von_mises`: Von Mises stress.
+        - `sigma1`: Principal stress component 1.
+        - `sigma2`: Principal stress component 2.
+
+    Notes
+    -----
+    - The Savitzky-Golay filter is applied along the specified axes with constant window
+      length and polynomial order. Ensure that `vx` and `vy` are on the appropriate axes.
+    - The strain rate tensor is symmetric, with off-diagonal components averaged appropriately.
+    - Stress calculations follow Glen's Flow Law and are scaled to kilopascals (kPa).
+    - Rotational calculations are based on the arctangent of velocity components to derive
+      the local flow direction.
+
+    Examples
+    --------
+    Using finite differences to compute strain and stress:
+    >>> result = compute_strain_stress(ds, dx=100, dy=100, sav_gol=False)
+
+    Using Savitzky-Golay filtering for gradient computation:
+    >>> result = compute_strain_stress(ds, sav_gol=True, window_length=13, polyorder=3)
+
+    Rotating strain rates:
+    >>> result = compute_strain_stress(ds, rotate=True)
+    """
+    # Initialize gradients dict (L)
+    L = {}
+    progress_bar = tqdm(total=4, desc=f'{"Computing gradients":<25}', position=0)
+    
+    # Compute velocty components using method of choice
+    if sav_gol:
+        # Apply savitzy golay filter to calculate gradients
+        # For ITS_LIVE dc:
+        ## x: axis=-1
+        ## y: axis=-2
+        L['11'] = sg_ufunc(ds.vx, window_length, polyorder, deriv=deriv, axis=-1) / dx
+        progress_bar.update(1)
+        L['12'] = sg_ufunc(ds.vx, window_length, polyorder, deriv=deriv, axis=-2) / dy
+        progress_bar.update(1)
+        L['21'] = sg_ufunc(ds.vy, window_length, polyorder, deriv=deriv, axis=-1) / dx
+        progress_bar.update(1)
+        L['22'] = sg_ufunc(ds.vy, window_length, polyorder, deriv=deriv, axis=-2) / dy
+    
+    else:
+        # Compute strain rates using xr.gradient
+        L['11'] = ds.vx.differentiate('x')
+        progress_bar.update(1)
+        L['12'] = ds.vx.differentiate('y')
+        progress_bar.update(1)
+        L['21'] = ds.vy.differentiate('x')
+        progress_bar.update(1)
+        L['22'] = ds.vy.differentiate('y')
+
+    progress_bar.update(1)
+    progress_bar.close()
+    
+    # Initialize strain rate tensor (E)
+    E = {}
+
+    # Assign components to tensor
+    E['11'] = L['11']
+    E['12'] = 0.5 * (L['12'] + L['21'])  # Symmetric part for off-diagonal terms
+    E['22'] = L['22']
+    
+    # Rotate Strain Rates
+    if rotate:
+        progress_bar = tqdm(total=1, desc=f'{"Rotating Strain Rates":<25}', position=0)
+        theta = np.arctan2(ds.vy, ds.vx)
+        E = rotate_strain_rates(E, theta)
+        
+        progress_bar.update(1)
+        progress_bar.close()
+    
+    # Calculate effective strain rate
+    E['effective'] = np.sqrt(
+        0.5 * ((E['11'] ** 2) + (E['22'] ** 2)) + (E['12'] ** 2)
+    )
+    
+    progress_bar = tqdm(total=1, desc=f'{"Computing stresses":<25}', position=0)
+    # Stress Computation
+    S = _strain_stress(
+        E['effective'], E['11'], E['22'], A=A, n=n
+    )
+
+    progress_bar.update(1)
+    progress_bar.close()
+
+    # Assign new variables to dataset
+    ds['effective'] = E['effective']
+    ds['eps_xx'] = E['11']
+    ds['eps_yy'] = E['22']
+    ds['von_mises'] = S['VM']
+    ds['sigma1'] = S['11']
+    ds['sigma2'] = S['22']
+
     return ds
 
 ##################################################################################
 
-def compute_strain_stress(
-    vx: xr.DataArray | np.ndarray,
-    vy: xr.DataArray | np.ndarray,
-    dx: int = 120,
-    dy: int = 120,
-    axis: tuple = (1,2),
-    rotate: bool = False,
-) -> xr.DataArray | np.ndarray:
-    '''
-    Calculate the strain rate and Von Mises stress of the given velocities. 
+def rotate_strain_rates(E: dict, theta: xr.DataArray) -> dict:
+    """
+    Rotates the strain rate tensor components by the flow direction theta.
+    """
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+    cos2 = cos_theta**2
+    sin2 = sin_theta**2
+    cos_sin = cos_theta * sin_theta
 
-    Parameters:
-    -----------
-    vx (xr.DataArray | np.ndarray):
-        velocity in the x-direction
-    vy (xr.DataArray | np.ndarray):
-        velocity in the y-direction
-    dx (int, optional):
-        pixel length in m. Only needs to be passed if using numpy
-        Default to 120m
-    dy (int, optional):
-        pixel length in m. Only needs to be passed if using numpy
-        Default to 120m
-    axis (tuple, optional):
-        specifies the axis to take the gradient on. Defaults to (1,2), meaning (x, y)
-    rotate (bool, optional):
-        rotate the strain rate components to along flow, accross flow, and shear. Default to False
+    E_rot = {
+        '11': E['11'] * cos2 + 2 * E['12'] * cos_sin + E['22'] * sin2,
+        '22': E['11'] * sin2 - 2 * E['12'] * cos_sin + E['22'] * cos2,
+        '12': (E['22'] - E['11']) * cos_sin + E['12'] * (cos2 - sin2),
+    }
 
-    Returns:
-    --------
-    tuple of np.ndarray | xr.DataArray:
-        returns dataarray or numpy arrays of computed variables 
-        Returns in order: ('eps_eff', 'eps_xx', 'eps_yy', 'sigma_vm', 'sigma1', 'sigma2')
-    '''
-    # Sanitize inputs, raise value errors
-    assert (type(vx) == type(vy)), "Input velocities must be same data type"
-    assert isinstance(vx, (xr.DataArray, np.ndarray)), "Input velocities must be numpy arrays or xarray DataArrays"
-    assert isinstance(dx, int) & isinstance(dy, int), "dx and dy must be integers"
-    assert isinstance(axis, (tuple)), 'axis must be a tuple'
-    assert isinstance(rotate, bool), 'rotate must be a boolean'
-
-    xarray = False
-    if isinstance(vx, xr.DataArray):
-        xarray = True
-    
-    # use xarray to compute gradients
-    if xarray:
-        # xarray takes the coord size into account 
-        # no need to include dy | dx
-        du_dx = vx.differentiate('x')
-        du_dy = vx.differentiate('y')
-        dv_dx = vy.differentiate('x')
-        dv_dy = vy.differentiate('y')
-
-    # use numpy to compute gradients
-    else:
-        # Calculate the gradients of the x and y velocities
-        du_dx, du_dy = np.gradient(vx, dx, dy, axis=axis)
-        dv_dx, dv_dy = np.gradient(vy, dx, dy, axis=axis)
-
-    # strain rate tensor
-    eps_xy = 0.5 * (dv_dx + du_dy)
-    eps_xx = du_dx
-    eps_yy = dv_dy
-
-    # rotate the directions if passed
-    if rotate:
-        # Angle of rotation
-        theta = np.arctan2(vy, vx)
-        
-        # use alley et al equations to rotate strain rates
-        # longitudinal, transverse, shear
-        eps_lon = (
-            (eps_xx * (np.cos(theta) ** 2)) + 
-            (2 * eps_xy * np.cos(theta) * np.sin(theta)) + 
-            (eps_yy * (np.sin(theta) ** 2))
-        )
-        eps_trn = (
-            (eps_xx * (np.sin(theta) ** 2)) - 
-            (2 * eps_xy * np.cos(theta) * np.sin(theta)) + 
-            (eps_yy * (np.cos(theta) ** 2))
-        )
-        eps_shr = (
-            (eps_yy - eps_xx) * np.cos(theta) * np.sin(theta) + 
-            eps_xy * ((np.cos(theta) ** 2) - (np.sin(theta) ** 2))
-        )
-
-        # Save into corresponding variables
-        eps_xx = eps_lon
-        eps_yy = eps_trn
-        eps_xy = eps_shr
-    # Calculate effective strain rate
-    eps_eff = np.sqrt(0.5 * (eps_xx ** 2 + eps_yy ** 2) + eps_xy ** 2)
-
-    # Call fcn that computes stress tensor
-    sigma_vm, sigma1, sigma2 = _strain_stress(eps_eff, eps_xx, eps_yy)
-
-    return eps_eff, eps_xx, eps_yy, sigma_vm, sigma1, sigma2
+    return E_rot
 
 ##################################################################################
 
-def _strain_stress(
-    e_eff: np.ndarray | xr.DataArray,
-    e_xx: np.ndarray | xr.DataArray,
-    e_yy: np.ndarray | xr.DataArray, 
-    A: float = 3.5e-25
-) -> np.ndarray | xr.DataArray:
-    '''
-    Returns Von Mises stress given x and y stress 
-    values following Vaughan 1993.
+def _strain_stress(effective, exx, eyy, A=3.5e-25, n=3):
+    """
+    Computes stresses using Glen's Flow Law.
+    """
+    exp = (1 - n) / n
+    A *= 365 * 24 * 3600  # Convert from 1/year to 1/second
+
+    # Deviatoric stress tensor
+    T = {
+        '11': (A**(-1 / n)) * (effective**exp) * exx,
+        '22': (A**(-1 / n)) * (effective**exp) * eyy,
+    }
+
+    # Cauchy stress tensor components
+    S = {
+        '11': (2 * T['11'] + T['22']) / 1000,
+        '22': (T['11'] + 2 * T['22']) / 1000,
+    }
+    # Compute Von Mises stress from Cauchy tensor components
+    S['VM'] = np.sqrt((S['11']**2 + S['22']**2 - S['11'] * S['22']))
     
-    Parameters:
-    -----------
-    e_eff (np.ndarray | xr.DataArray):
-        Effective strain rate
-    e_xx (np.ndarray | xr.DataArray):
-        Array of strain rate in x direction (longitudinal) 
-    e_yy (np.ndarray | xr.DataArray):
-        Array of strain rate in y direction (transverse)
-    A (float):
-        Coefficient 'A' for Glen's Flow Law. Defaults to 3.5e-25
+    return S
 
-    Returns:
-    --------
-    sigma_vm (np.ndarray | xr.DataArray):
-        The Von Mises tensile stress in kPa
-    sigma1 (np.ndarray | xr.DataArray):
-        Principle stress 1 in kPa
-    sigma2 (np.ndarray | xr.DataArray):
-        Principle stress 2 in kPa
-    '''
-    # Canonical exponent of 3
-    n = 3
+##################################################################################
 
-    # Use Glens Flow law to relate strain rate to stress (following Grinsted)    
-    # exponent variable
-    exp = ((1 - n) / n)
-    A *= (365 * 24 * 3600)    # Units converter from 1/yr to 1/s
-    
-    tau_xx = (A ** (-1 / n)) * (e_eff ** exp) * e_xx
-    tau_yy = (A ** (-1 / n)) * (e_eff ** exp) * e_yy
-
-    # Convert from tau to sigma, principle stresses
-    sigma1 = (2 * tau_xx) + tau_yy
-    sigma2 = tau_xx + (2 * tau_yy)
-
-    # Compute Von Mises Stress following Vaughan et al
-    sigma_vm = np.sqrt((sigma1 ** 2) + (sigma2 ** 2) - (sigma1 * sigma2))
-
-    return sigma_vm / 1000, sigma1 / 1000, sigma2 / 1000
+def sg_ufunc(arr, window_length, polyorder, deriv, axis):
+    """
+    Applies Savitzky-Golay filter via xarray's apply_ufunc.
+    """
+    filt_arr = xr.apply_ufunc(
+        sg, arr,
+        kwargs={'window_length':window_length, 'polyorder':polyorder, 'deriv':deriv, 'axis':axis}
+    )
+    return filt_arr
 
 ##################################################################################
 
 def lagrangian_frame(
     ds: xr.Dataset, 
-    geometry: shapely.geometry.polygon.Polygon, 
+    geometry: Polygon, 
     start_index: int = 0,
     steps_forward: int = None,
     steps_reverse: int = None,
     epsg: int = 3031,
-    filtersize: int = 2,
-    remove_threshold = None
+    filtersize: int = None,
+    remove_threshold : float = None
 ) -> xr.Dataset:
-    '''
-    Given an xr.Dataset with velocity components and a shapely Polygon, 
-    returns clipped dataset tracking the feature as it moves through time. 
+    """
+    Tracks a moving polygonal feature over time within a spatial dataset, leveraging velocity data to predict changes 
+    in the feature's geometry.
 
-    Parameters:
-    -----------
-    ds (xr.Dataset):
-        dataset containing velocity components
-    geometry (shapely Polygon):
-        polgyon outline of the feature to be tracked
-    start (int, optional):
-        Optional parameter of the starting index. If passed, start from that index.
-        Default: 0
-    reversed (bool):
-        calculates original starting place of polygon, then steps forward
-    steps (int, optional):
-        number of time frames to track the feature. If none, 
-        covers all time steps in dataset
-    filtersize (int, optional):
-        size of window in median filter
-        Defaults to 2
-    remove_threshold (float, optional):
-        if you would like to remove values based on the fracture confidence variable,
-        specify the threshold to remove from the next frame
-
-    Returns:
-    --------
-    lagrange_frame (xr.Dataset):
-        dataset that follows on the passed polygon as it moves through time
-    '''
-    # defensive programming
-    assert isinstance(ds, xr.Dataset), 'ds must be xr.Dataset'
-    assert isinstance(geometry, shapely.geometry.polygon.Polygon), \
-        'geometry must be a shapely polygon'
-    assert isinstance(epsg, int), 'EPSG must be an integer'
-    assert isinstance(start_index, int), 'Start index must be an Integer'
-    assert isinstance(steps_forward, (NoneType, int)), \
-        'Number of steps forward must be None or integer'
-    assert isinstance(steps_reverse, (NoneType, int)), \
-        'Number of steps in reverse must be None or int'
-    assert isinstance(filtersize, int), 'filter size must be an integer'
-    assert isinstance(remove_threshold, (float, NoneType)), \
-        'remove_threshold must be float or None'
-    
-    # variable initialization
-    # If steps not passed, set end index to last timestep
-    if isinstance(steps_forward, NoneType):
-        end = len(ds.mid_date)
-        
-    # If steps passed, set end index to starting index + num of steps
-    else:      
-        end = start_index + steps_forward
-    
-    if end > len(ds.mid_date):
-        end = len(ds.mid_date)
-    
-    # get list of points from polygon
-    xs, ys = np.array(geometry.exterior.coords).T
-        
-    # If reversed steps given, move polygon backwards to beginning timestep
-    if isinstance(steps_reverse, int): 
-        for i in range(steps_reverse):
-            move_points(xs, ys, (start_index-i), ds, reversed=True)
-            
-        # Create original polygon, subtract reversed indexes from starting index
-        geometry = Polygon(np.array([xs, ys]).T)
-        start_index -= steps_reverse
-    
-    # Set remove to False if None, True if value passed
-    remove = False if isinstance(remove_threshold, NoneType) else True
-    
-    # Clip original area from first time slice, apply median filter
-    gdf = gpd.GeoDataFrame(geometry=[geometry], crs=f'EPSG:{epsg}')
-    first_frame = ds.isel(mid_date=start_index).rio.clip(gdf.geometry, gdf.crs, all_touched=True)
-    first_frame = apply_med_filt(first_frame, filtersize)
-    
-    # initialize list of frames, add first frame to that
-    clipped_frames = [first_frame]
-    
-    # If removing values, get all points above threshold
-    if remove:
-        fracture_clip = first_frame.where(first_frame.fracture_conf > remove_threshold)
-        
-        # extract points to x and y arrays
-        nan_pts = fracture_clip.fracture_conf.stack(points=['x','y'])
-        xs_f, ys_f = nan_pts[nan_pts.notnull()].x.data, nan_pts[nan_pts.notnull()].y.data
-    
-    # iterate from start to end index, stepping in the direction specified
-    for i in range(start_index, (end-1)):
-        # call function to move each point in polygon
-        move_points(xs, ys, i, ds)
-        
-        # Make a shapely Polgyon of the new points
-        geometry = Polygon(np.array([xs, ys]).T)
-        # make GDF of the polgyon
-        gdf = gpd.GeoDataFrame(geometry=[geometry], crs=f'EPSG:{epsg}')
-        
-        # clip the next time slice to the moved polygon
-        next_frame = ds.isel(mid_date=(i+1)).rio.clip(gdf.geometry, gdf.crs, all_touched=True)
-        next_frame = apply_med_filt(next_frame, filtersize)
-            
-        if remove:
-            # call function to move points of fracture
-            move_points(xs_f, ys_f, i, ds)
-            
-            # get all points over and 85% fracture confidence from new frame
-            # must be done before masking with NaN's, or values get lost
-            fracture_clip = next_frame.where(next_frame.fracture_conf > remove_threshold)
-        
-            for xval, yval in zip(xs_f, ys_f):
-                nearest_point = next_frame.sel(x=xval, y=yval, method='nearest')
-                next_frame.loc[{'x': nearest_point.x.data, 'y': nearest_point.y.data}] = np.nan
-        
-            # extract fractured points to a list
-            nan_pts = fracture_clip.fracture_conf.stack(points=['x','y'])
-            xs_f, ys_f = nan_pts[nan_pts.notnull()].x.data, nan_pts[nan_pts.notnull()].y.data
-    
-        clipped_frames.append(next_frame)
-        
-    lagrange_frame = xr.concat(clipped_frames, dim='mid_date')
-    return lagrange_frame
-
-##################################################################################
-
-def parcel_strain_stress(
-    ds: xr.Dataset, 
-    x: (int | float),
-    y: (int | float),
-    buffer: (int | float) = 0,
-    start_index: '(int, optional)' = None,
-    steps_forward: '(int, optional)' = None, 
-    steps_reverse: '(int, optional)' = None
-) -> xr.Dataset:
-    '''
-    Returns the time series values of a single point as it moves
-    across the domain with time. It integrates the strain rate to
-    calculate the strain of a parcel and adds as new variables to the dataset
+    The function iteratively updates a given polygonal geometry to reflect its movement across time steps within an 
+    `xarray.Dataset`. The dataset is expected to contain velocity components (`vx` and `vy`) which guide the movement 
+    of the polygon. Additional parameters enable filtering of the dataset, handling of fracture points, and temporal 
+    movement both forward and backward.
 
     Parameters:
     -----------
     ds : xr.Dataset
-        xarray dataset to be passed to move_points function. Must have x- and y-velocity,
-        effective, x, and y strain rates.
-    x : (int, float)
-        Integer or float value of the x-coordinate of the point of interest
-    y : (int, float)
-        integer or float value of the x-coordinate of the point of intetest
-    buffer : (int, float, optional)
-        integer or float amount of distance to average around the point of interest
-    start_index : (int, optional)
-        Time index of the x- and y-coordinates given. If none passed, start index of 0 is assumed.
-        Gives flexibility of where and when a point can be tracked
-    steps_forward : (int, optional)
-        Number of timesteps to take in the forward time direction. If none passed, will step as many indexes
-        are available in the time index
-    steps_reverse : (int, optional)
-        Number of timesteps to take in the reverse time direction. If non passed, 0 is assumed.
-        Allows the tracking of points identfied as crevassed in the middle of a time series before they broke.
+        The dataset containing velocity fields `vx` and `vy`, and a temporal dimension `mid_date`. 
+        It must also include spatial coordinates and optionally a fracture confidence field (`fracture_conf`).
+    geometry : shapely.geometry.Polygon
+        A polygonal shape representing the feature of interest, used as the initial geometry for tracking.
+    start_index : int, optional
+        The time index to start the tracking process (default is 0, the first time step).
+    steps_forward : int, optional
+        The number of time steps to track forward in time. If `None`, all available time steps are processed.
+    steps_reverse : int, optional
+        The number of time steps to move backward from `start_index` to adjust the initial geometry. Defaults to `None`.
+    epsg : int, optional
+        EPSG code defining the coordinate reference system of the dataset (default is 3031, commonly used for polar data).
+    filtersize : int, optional
+        Size of the median filter applied to smooth the final output dataset (default is `None`, meaning no filtering).
+    remove_threshold : float, optional
+        A threshold value for fracture confidence. Points with fracture confidence below this threshold are removed.
+        If provided, it must be a float between 0 and 1 (default is `None`).
 
     Returns:
     --------
-    parcel (ds) :
-        xarray dataset with time variable remaining. Appends total effective, x-, and y-direction strains
-    xs (list) :
-        list of x-coordinates in order from the first to last timestep
-    ys (list) : 
-        list of y-coordinates in order from the first to last timestep
-    '''
-    assert isinstance(ds, xr.Dataset), 'da must be a DataArray'
-    assert type(x) == type(y), 'x and y must be the same type'
-    assert isinstance(x, (int, float)), 'x- and y-points must be int or float'
-    assert isinstance(start_index, (int, NoneType)), 'Starting index must be an int or None'
-    assert isinstance(steps_forward, (int, NoneType)), 'Steps forward must be an int or None'
-    assert isinstance(steps_forward, (int, NoneType)), 'Steps reverse must be an int or None'
-    assert isinstance(buffer, int)
+    xr.Dataset
+        A new dataset clipped to the geometry of the moving polygon across the specified time steps. The resulting
+        dataset may optionally include smoothed data if a `filtersize` is provided.
+
+    Raises:
+    -------
+    TypeError
+        If inputs are of invalid types, e.g., `ds` is not an `xarray.Dataset` or `geometry` is not a `shapely.Polygon`.
+    ValueError
+        If `remove_threshold` is not a float or is outside the range [0, 1].
+
+    Notes:
+    ------
+    - The function employs a reverse tracking option (`steps_reverse`) to refine the starting position of the polygon.
+    - Polygon movement is guided by velocity fields in the dataset, and the new position is used for iterative clipping.
+    - If `remove_threshold` is provided, the function tracks and removes fracture points, ensuring they do not influence
+      subsequent frames.
+    - The dataset may include spatial attributes like `fracture_conf` for more nuanced operations during tracking.
+
+    Examples:
+    ---------
+    >>> from shapely.geometry import Polygon
+    >>> import xarray as xr
+    >>> dataset = xr.open_dataset("velocity_data.nc")
+    >>> polygon = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+    >>> tracked_ds = lagrangian_frame(
+    ...     ds=dataset, 
+    ...     geometry=polygon, 
+    ...     start_index=0, 
+    ...     steps_forward=10, 
+    ...     filtersize=3
+    ... )
+    >>> tracked_ds.to_netcdf("tracked_output.nc")
+    """
+    # Defensive programming
+    if not isinstance(ds, xr.Dataset):
+        raise TypeError("Input ds must be an xarray.Dataset")
+    if not isinstance(geometry, Polygon):
+        raise TypeError("Input geometry must be a shapely Polygon")
+    if steps_forward is not None and not isinstance(steps_forward, int):
+        raise TypeError("steps_forward must be None or an integer")
+    if steps_reverse is not None and not isinstance(steps_reverse, int):
+        raise TypeError("steps_reverse must be None or an integer")
+    if remove_threshold is not None:
+        if not isinstance(remove_threshold, float) or not (0 <= remove_threshold <= 1):
+            raise ValueError("remove_threshold must be a float between 0 and 1")
+    if filtersize is not None and not isinstance(filtersize, int):
+        raise TypeError("filtersize must be None or an integer")
+    
+    # Determine end index
+    end_index = (
+        len(ds.mid_date) if steps_forward is None 
+        else min(start_index + steps_forward, len(ds.mid_date))
+    )
+    
+    # Extract coordinates from the input polygon
+    points = np.array(geometry.exterior.coords)
+    
+    # Reverse steps (optional)
+    if steps_reverse:
+        for i in tqdm(range(steps_reverse), desc="Reversing Polygon Position"):
+            points = move_points(points, start_index - i, ds, reverse_direction=True)
+        start_index -= steps_reverse
+    
+    # Clip original area
+    gdf = gpd.GeoDataFrame(geometry=[Polygon(points)], crs=f"EPSG:{epsg}")
+    crs = gdf.crs
+    first_frame = ds.isel(mid_date=start_index).rio.clip(gdf.geometry, crs, all_touched=True)
+    
+    # Initalize list of frames
+    clipped_frames = [first_frame]
+    
+    # Efficient handling of fracture points (vectorized approach)
+    if remove_threshold is not None:
+        fracture_points = (
+            first_frame.fracture_conf
+            .where(first_frame.fracture_conf > remove_threshold)
+            .stack(points=('x', 'y'))
+            .dropna(dim='points')
+        )
+        fracture_points_coords = (
+            fracture_points.points.data.tolist() 
+            if fracture_points.sizes['points'] > 0 
+            else np.empty((0,2))
+        )
+    
+    # Iterate through time steps
+    for t in tqdm(range(start_index, end_index - 1), desc="Tracking Polygon Over Time"):
+        # Move points
+        points = move_points(points, t, ds)
+        
+        # Clip next frame
+        geometry = Polygon(points)
+        next_frame = ds.isel(mid_date=(t + 1)).rio.clip([geometry], crs, all_touched=True)
+        
+        # Efficient fracture points removal (masking)
+        if remove_threshold is not None:
+            # Move fractured coords
+            fracture_points_coords = move_points(fracture_points_coords, t, ds)
+        
+            # Create a mask for fracture points
+            fracture_mask = np.zeros_like(next_frame['fracture_conf'], dtype=bool)
+        
+            for x, y in fracture_points_coords:
+                # Find the closest point in the grid (use nearest if necessary)
+                x_idx = np.argmin(np.abs(next_frame.x.values - x))
+                y_idx = np.argmin(np.abs(next_frame.y.values - y))
+        
+                # Set the corresponding position in the mask to True
+                fracture_mask[y_idx, x_idx] = True
+        
+            # Apply the mask: set all values to NaN where the mask is True
+            next_frame = next_frame.where(~fracture_mask, np.nan)
+    
+            # Use vectorized approach to collect new fratured ice
+            new_fracture_points = (
+                next_frame.fracture_conf
+                .where(next_frame.fracture_conf > remove_threshold)
+                .stack(points=('x', 'y'))
+                .dropna(dim='points')
+            )
+            new_fracture_points_coords =(
+                new_fracture_points.points.data.tolist() 
+                if new_fracture_points.sizes['points'] > 0 
+                else np.empty((0,2))
+            )
+    
+            # Stack new fractures on old fractures
+            fracture_points_coords = np.vstack((fracture_points_coords, new_fracture_points_coords))
+    
+        # Append frame to list
+        clipped_frames.append(next_frame)
+    
+    # Concatenate into one dataset
+    lagrange_frame = xr.concat(clipped_frames, dim='mid_date')
+    return apply_med_filt(lagrange_frame, size=filtersize) if filtersize is not None else lagrange_frame
+
+##################################################################################
+
+def parcel_strain_stress(
+    ds: xr.Dataset,
+    x: (int | float),
+    y: (int | float),
+    buffer: (int | float) = 0,
+    start_index: int = None,
+    steps_forward: int = None,
+    steps_reverse: int = None,
+    filtersize: int = None
+) -> xr.Dataset:
+    """
+    Computes the time-series values for a parcel moving across a domain over time. 
+    The function integrates strain rate to compute the total strain experienced by the parcel 
+    and appends these values as new variables to the dataset.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        The input xarray dataset. Must contain `x` and `y` velocities and strain rates 
+        (`effective`, `eps_xx`, `eps_yy`) as variables.
+    x : int or float
+        The x-coordinate of the initial point of interest.
+    y : int or float
+        The y-coordinate of the initial point of interest.
+    buffer : int or float, optional
+        Distance for spatial averaging around the point of interest. Default is 0 (no averaging).
+    start_index : int, optional
+        The time index corresponding to the given (x, y) coordinates. If None, defaults to 0.
+    steps_forward : int, optional
+        The number of timesteps to move forward in time. Defaults to as many timesteps 
+        as available from the start index.
+    steps_reverse : int, optional
+        The number of timesteps to move backward in time. Defaults to 0.
+    filtersize : int, optional
+        The size of the median filter applied to smooth the output dataset. Default is None, meaning no filtering.
+
+    Returns
+    -------
+    parcel : xr.Dataset
+        A dataset with the time dimension containing the original variables and new variables:
+        - `effective_strain`: Cumulative effective strain.
+        - `e_xx`: Cumulative strain in the x-direction.
+        - `e_yy`: Cumulative strain in the y-direction.
+    points : np.ndarray
+        An array of shape (N, 2) where N is the total number of timesteps. Each row contains 
+        the x and y coordinates of the parcel at each timestep.
+
+    Raises
+    ------
+    TypeError
+        If input types are not as expected.
+    ValueError
+        If `start_index` is out of bounds, if `steps_reverse` or `steps_forward` exceed the dataset limits, 
+        or if any parameters are inconsistent with the dataset dimensions.
+
+    Notes
+    -----
+    - The function assumes that the dataset's `mid_date` dimension corresponds to the time axis.
+    - The strain rate is integrated cumulatively over time for each timestep.
+    - The `move_points` function is used to determine the parcel's location at each timestep.
+    - If `filtersize` is specified, a median filter is applied using the `apply_med_filt` function.
+
+    Examples
+    --------
+    >>> parcel, points = parcel_strain_stress(
+    ...     ds=my_dataset, x=100.0, y=50.0, buffer=10.0, 
+    ...     start_index=0, steps_forward=10, steps_reverse=5, filtersize=3
+    ... )
+    >>> print(parcel)
+    >>> print(points)
+    """
+    if not isinstance(ds, xr.Dataset):
+        raise TypeError('Input ds must be an xarray.Dataset')
+    if not ((type(x) == type(y)) & (isinstance(x, (int, float)))):
+        raise ValueError('x- and y-points must be same type, int or float')
+    if start_index is not None and not isinstance(start_index, int):
+        raise TypeError('Starting index must be an int or None')
+    if steps_forward is not None and not isinstance(steps_forward, int):
+        raise TypeError("steps_forward must be None or an integer")
+    if steps_reverse is not None and not isinstance(steps_reverse, int):
+        raise TypeError("steps_reverse must be None or an integer")
+    if not isinstance(buffer, (int, float)):
+        raise TypeError("buffer must be inter or float")
+    if filtersize is not None and not isinstance(filtersize, int):
+        raise TypeError("filtersize must be None or an integer")
     
     # Initialize variable, ensure indexing works
     # Grab length of time index
     length = len(ds.mid_date)
     
     # If start index not given, 
-    if isinstance(start_index, NoneType):
+    if start_index is None:
         start_index = 0
         steps_reverse = 0
     
     else:
         # If start index given, check that the index is less than number of timesteps
-        assert start_index < length, \
-            "Starting index must be at least 1 less than the mid_date length"
+        if start_index >= length:
+            raise ValueError("Starting index must be at least 1 less than the mid_date length")
     
     # If steps forward not given, go as many steps forward as possible
-    if isinstance(steps_forward, NoneType):
+    if steps_forward is None:
         steps_forward = length - start_index
-        
-    else:
-        final_step = steps_forward + start_index
-        # If steps forward given
-        assert final_step <= len(ds.mid_date), \
-            "Too many steps forward. Decrease the number of timesteps"
     
     # If no steps reversed given, set to 0
-    if isinstance(steps_reverse, NoneType):
+    if steps_reverse is None:
         steps_reverse = 0
-    
-    else:
-        first_step = start_index - steps_reverse
-        assert first_step >= 0, "Too many steps reverse. Decrease the number of timesteps"
     
     # Define start and end index
     first_step = start_index - steps_reverse
     final_step = start_index + steps_forward
+
+    if first_step < 0:
+        raise ValueError("Too many steps reverse. Decrease the number of timesteps")
+
+    if final_step > len(ds.mid_date):
+        raise ValueError("Too many steps forward. Decrease the number of timesteps")
     
-    # Define x- and y-arrays for move_points func
-    move_x = [x]
-    move_y = [y]
+    # Define points array for move_points func
+    point = np.c_[x, y]
+
+    points_f = point.copy()
     
     # Add initial pt to forward step
-    x_forward = [move_x[0]]
-    y_forward = [move_y[0]]
     for i in range(steps_forward):
-        move_points(move_x, move_y, (start_index+i), ds)
-        x_forward.append(move_x[0])
-        y_forward.append(move_y[0])
+        point = move_points(point, (start_index+i), ds)
+        points_f = np.vstack((points_f, point))
     
-    move_x = [x]
-    move_y = [y]
-    
-    # Initialize list for points in reverse
-    x_reverse = []
-    y_reverse = []
+    point = np.c_[x, y]
+    points_rev = np.empty((0,2))
     for i in range(steps_reverse):
-        move_points(move_x, move_y, (start_index-i), ds, reversed=True)
-        x_reverse.append(move_x[0])
-        y_reverse.append(move_y[0])
+        point = move_points(point, (start_index-i), ds, reverse_direction=True)
+        points_rev = np.vstack((points_rev, point))
     
-    # Make full list of x values in increasing order
-    xs = x_reverse[::-1] + x_forward
-    ys = y_reverse[::-1] + y_forward
+    points = np.vstack((points_rev[::-1], points_f))
     
     # Initialize list for selection of dfs for each point
     point_vals = []
+    progress_bar = tqdm(range(first_step, final_step), desc="Tracking Parcel")
     
     for i, time_index in enumerate(range(first_step, final_step)):
-        xx = xs[i]
-        yy = ys[i]
+        x, y = points[i]
         
-        parcel = ds.sel(x=slice(xx-buffer, xx+buffer), y=slice(yy-buffer, yy+buffer)).mean(['x','y'], skipna=True)
+        parcel = ds.sel(x=slice(x-buffer, x+buffer), y=slice(y-buffer, y+buffer)).mean(['x','y'], skipna=True)
         point_vals.append(parcel.isel(mid_date=time_index))
-    
+        progress_bar.update(1)
+
+    progress_bar.close()
     point_srs = xr.concat(point_vals, dim='mid_date')
-    strain = point_srs[['eps_eff', 'eps_xx', 'eps_yy']].cumsum(dim='mid_date')
-    strain = strain.rename_vars({'eps_eff':'e_eff', 'eps_xx':'e_xx', 'eps_yy':'e_yy'})
-        
+    strain = point_srs[['effective', 'eps_xx', 'eps_yy']].cumsum(dim='mid_date')
+    strain = strain.rename_vars({'effective':'effective_strain','eps_xx':'e_xx', 'eps_yy':'e_yy'})
+    
     parcel = xr.merge([point_srs, strain])
 
-    return parcel, xs, ys
+    if filtersize:
+        parcel = apply_med_filt(parcel, filtersize)
+
+    return parcel, points
 
 ##################################################################################
 
-def move_points(
-    xs: (list | np.ndarray),
-    ys: (list | np.ndarray), 
-    index: (int), 
-    ds: xr.Dataset,
-    reversed: bool = False
-):
-    '''
-    Given x- and y- coordinates, a time index, and a dataset with
-    x- and y-velocities moves the points to the location they would be
-    after one month. Velocity in m/yr, coordinates in meters.
-    '''
-    assert type(xs) == type(ys), 'xs and ys must have the same type'
-    assert isinstance(xs, (list, np.ndarray)), 'xs and ys must be a list or numpy array'
-    assert len(xs) == len(ys), 'Number of x and y coordinates should be equal'
-    assert all([isinstance(x, (int, float)) for x in xs]), 'all xs must be int or float values'
-    assert all([isinstance(y, (int, float)) for y in ys]), 'all ys must be int or float values'
-    assert isinstance(index, int), 'index must be and integer'
-    assert isinstance(ds, xr.Dataset), 'ds must be an xarray Dataarray'
-    assert isinstance(reversed, bool), 'reversed must be a boolean'
-    
-    for i, (x, y) in enumerate(zip(xs, ys)):
-        # if REVERSE:
-        # Get velocities from previous timestep
-        # make negative
-        if reversed:
-            vx = ds.vx[index-1].sel(x=x, y=y, method='nearest').data
-            vy = ds.vy[index-1].sel(x=x, y=y, method='nearest').data
-            vx = vx * -1
-            vy = vy * -1
-        
-        # Get vels from current timestep
-        else:
-            # get x and y velocity for the coordinate pt
-            vx = ds.vx[index].sel(x=x, y=y, method='nearest').data
-            vy = ds.vy[index].sel(x=x, y=y, method='nearest').data
-            
-        if np.isnan(vx):
-            vx = 0
-        if np.isnan(vy):
-            vy = 0
-        
-        # add amt of distance travelled over the month
-        xs[i] += (vx / 12)
-        ys[i] += (vy / 12)
+def move_points(points, index, ds, reverse_direction=False, snap=False):
+    """
+    Adjusts the positions of coordinate points based on velocity fields.
+
+    This function moves a set of (x, y) coordinate pairs by applying velocity components (`vx`, `vy`) 
+    from a dataset at a specific time step. Optionally, points can be snapped to the nearest grid 
+    locations, and duplicates removed if snapping is enabled.
+
+    Parameters
+    ----------
+    points : np.ndarray
+        A 2D array of shape (n, 2) where each row represents an (x, y) coordinate pair.
+    index : int
+        Time step index to use for velocity data.
+    ds : xr.Dataset
+        The dataset containing `vx` and `vy` variables.
+    reverse_direction : bool, optional
+        If True, moves points in the reverse direction by negating the velocities. Default is False.
+    snap : bool, optional
+        If True, snaps points to the nearest grid center based on the dataset's resolution and removes duplicates. 
+        Default is False.
+
+    Returns
+    -------
+    np.ndarray
+        Updated array of (x, y) coordinate pairs after applying the velocity adjustments.
+
+    Notes
+    -----
+    - Velocities are scaled by a factor of 1/12 to approximate monthly motion.
+    - Snapping aligns points to the dataset's grid spacing and origin.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import xarray as xr
+    >>> points = np.array([[100, 200], [150, 250]])
+    >>> dataset = xr.open_dataset("velocity_data.nc")
+    >>> updated_points = move_points(points, index=0, ds=dataset, reverse_direction=True, snap=True)
+    >>> print(updated_points)
+    """
+    # Determine x and y grid spacing
+    x_spacing = np.abs(np.diff(ds.x.values).mean())
+    y_spacing = np.abs(np.diff(ds.y.values).mean())
+
+    # Determine x and y offsets (origin alignment)
+    x_offset = ds.x.values.min() % x_spacing
+    y_offset = ds.y.values.min() % y_spacing
+
+    updated_points = points.copy()
+
+    for i, (x, y) in enumerate(updated_points):
+        # Fetch velocities at the nearest grid point
+        vx = ds.vx[index].sel(x=x, y=y, method="nearest").data
+        vy = ds.vy[index].sel(x=x, y=y, method="nearest").data
+
+        # Handle NaN velocities by setting to zero
+        if np.isnan(vx): vx = 0
+        if np.isnan(vy): vy = 0
+
+        # Apply velocity move; reverse direction if specified
+        factor = -1 if reverse_direction else 1
+        x += factor * (vx / 12)
+        y += factor * (vy / 12)
+
+        # Snap points to the nearest grid center if snapping is enabled
+        if snap:
+            x = round((x - x_offset) / x_spacing) * x_spacing + x_offset
+            y = round((y - y_offset) / y_spacing) * y_spacing + y_offset
+
+        updated_points[i] = [x, y]
+
+    # Remove duplicates if snapping is enabled
+    # return np.unique(updated_points, axis=0) if snap else updated_points
+    return updated_points
 
 ##################################################################################
 
@@ -692,133 +898,6 @@ def apply_med_filt(arr, size=3):
         arr,
         kwargs={'size':size}
     )
-
-##################################################################################
-
-def plotting_stress(
-    ds: xr.Dataset,
-    data_vars: list | tuple,
-    name: str = None, 
-    area: list | tuple = None,
-    selected: list | tuple = None,
-    figsize: tuple = (20,9),
-    vmax: int | float = None
-):
-    '''
-    Takes Xarray datacube and the gpd vector and plots the stress and strain rates of the glacier
-    Has an outline of the body 
-
-    Parameters:
-    -----------
-    ds (xarray.Dataset):
-        xarray dataset.
-
-    data_vars (list | tuple):
-        names of the variables to plot a raster of, side by side
-
-    name (str, optional):
-        Name of the region being mapped. Defaults to None
-        
-    area (list | tuple, optional):
-        A point or rectangle to plot a time series over. 
-        If a single point is wanted: (x, y)
-        Is a rectangle is wanted: (x1, x2, y1, y2)
-
-    selected (list | tuple, optional):
-        If an area is passed, variable or pair of variables to plot over time.
-        Area and selected must be passed in tandem.
-    
-    figsize
-        passed to plt.subplots as the figsize for the plots.
-    '''
-    
-    # sanitize inputs, defensive programming
-    assert isinstance(ds, xr.Dataset), "ds must be of type xr.Dataset"
-
-    assert isinstance(data_vars, (tuple, list)), "data_vars must be passed in a tuple or list"
-
-    assert set(data_vars).issubset(ds), "data_vars must be variables in dataset" 
-
-    ncols = len(data_vars)
-    
-    time_series = False
-    selection = None
-    if isinstance(area, (tuple, list)):
-        ncols += 1
-        time_series = True
-        assert (len(area) == 2) | (len(area) == 2), "Area must be (x, y) or (x1, x2, y1, y2)"
-        assert isinstance(selected, (tuple, list)), "If an area is passed, 'selected' variables must be passed, too"
-        assert set(selected).issubset(ds), "Selected variables must be in the dataset"
-        assert ((len(selected) == 1) | (len(selected) == 2)), "Can only select 1 or 2 variables"
-        
-        if len(area) == 4:
-            box = True
-            x1, x2, y1, y2 = area
-            x = [x1, x2]
-            y = [y1, y2]
-            ds_sub = ds.sel(x=x, y=y, method='nearest').mean(dim=['x', 'y'], skipna=True)
-        else:
-            box = False
-            x, y = area
-            ds_sub = ds.sel(x=x, y=y, method='nearest')
-
-        selection = ds_sub[selected]
-
-    time_avg = ds[data_vars].mean(dim='mid_date', skipna=True)
-    
-    fig, axs = _fixed(time_avg, figsize, ncols, name, data_vars, time_series, selection=selection, vmax=vmax)
-
-    if time_series:
-        axs = axs[1:]
-        if box:
-            for ax in axs:
-                ax.fill([x1,x2,x2,x1], [y1,y1,y2,y2], facecolor='red', edgecolor='k', alpha=.5)
-                ax.fill([x1,x2,x2,x1], [y1,y1,y2,y2], facecolor='red', edgecolor='k', alpha=.5)
-            plt.show()
-        else:
-            for ax in axs:
-                ax.axvline(x=x, c='blue')
-                ax.axhline(y=y, c='blue')
-
-##################################################################################
-
-def _fixed(time_avg, figsize, ncols, name, data_vars, time_series, selection=None, vmax=None):
-    # time_avg = ds[data_vars].mean(dim='mid_date', skipna=True, keep_attrs=True)
-    
-    if isinstance(name, str):
-        name = ' on ' + name
-    
-    else:
-        name = ''
-    
-    fig, axs = plt.subplots(ncols=ncols, figsize=figsize, layout='constrained')
-    
-    if time_series:
-        vars = list(selection.data_vars)
-        if len(vars) == 1:
-            selection[f'{vars[0]}'].plot(ax=axs[0])
-            axs[0].set_title('Tensile Stress at Point')
-            axs[0].set_xlabel('Time')
-            axs[0].set_ylabel('Tensile Strength (kPa)')
-
-        else:
-            ax1 = axs[0]
-            selection[f'{vars[0]}'].plot(ax=ax1, x='mid_date')
-            # Plots on same axis
-            ax2 = ax1.twinx()
-            selection[f'{vars[1]}'].plot(ax=ax2, color='red')
-    
-    for i, variable in enumerate(data_vars):
-        ax = axs[-(i+1)]
-    
-        a = time_avg[variable].plot(ax=ax)
-        a.colorbar.set_label(f"{time_avg[variable].attrs['units']}")
-    
-        ax.set_aspect('equal')
-    
-    # Polishing the figure
-    fig.suptitle(f'Tensile Stress and Strain Rate{name}', fontsize=20)
-    return fig, axs
 
 ##################################################################################
 
@@ -914,49 +993,6 @@ def rewrite_nc(
     new_ds.rio.write_crs('EPSG:3031', inplace=True)
     new_ds_clip = new_ds.rio.clip(gdf.geometry, gdf.crs)
     new_ds_clip.to_netcdf(fname)
-
-##################################################################################
-
-def plot_vel_arrows(ds, figsize=None):
-    # Get absolute velocity
-    mean = ds.mean(dim='mid_date', skipna=True)
-    
-    vx = mean.vx
-    vy = mean.vy
-    vv = np.sqrt(vx**2 + vy**2)
-    # Plot velocity with imshow
-    fig, ax = plt.subplots(figsize=figsize, layout='constrained')
-    
-    # Plot velocity field colourmap
-    vv.plot(ax=ax, cmap="turbo", cbar_kwargs={'label':'Velocity [m a$^{-1}$]'})
-    
-    # # Account for 'strictly increasing' requirement for streamplots in newer matplotlibs:
-    # # flip if Y is decreasing rather than increasing. This is only necessary for plotting
-    # streamplots, not quiverplots.
-    if vv.y.values[1] - vv.y.values[0] < 0:
-        vv_flip = vv.reindex(y = vv.y[::-1])
-        vx_flip = vx.reindex(y = vx.y[::-1])
-        vy_flip = vy.reindex(y = vy.y[::-1])
-    else: 
-        vv_flip = vv
-        vx_flip = vx
-        vy_flip = vy
-    
-    
-    # # Plot flow direction using streamplot
-    plt.streamplot(
-        vv_flip.x.values, 
-        vv_flip.y.values, 
-        vx_flip.values, 
-        vy_flip.values,
-        color='white',
-        linewidth=0.6,
-        density=1.2,
-    )
-    
-    ax.ticklabel_format(scilimits=(6,6))
-    ax.set_title(None)
-    ax.set_aspect('equal')
 
 ##################################################################################
 # end of file
