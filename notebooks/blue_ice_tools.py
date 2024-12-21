@@ -120,6 +120,8 @@ def get_data_cube(
     urls: list | tuple | np.ndarray = None, 
     epsg: int = 3031,
     dt_delta: int = None,
+    start_date: str = None,
+    end_date: str = None,
     engine: str = 'zarr'
 ) -> xr.Dataset:
     """
@@ -135,6 +137,10 @@ def get_data_cube(
         EPSG code for the CRS. Defaults to 3031.
     dt_delta : int, optional
         Maximum allowed time difference (in days) for image pairs. Default is None (no filtering).
+    start_date : string, optional
+        First date to include data in the dataset. Default is None (beginning of record).
+    end_date : string, optional
+        Last date to include in dataset. Default is None (most recent image)
     engine : str, optional
         Engine used for reading Zarr files. Defaults to 'zarr'.
 
@@ -169,6 +175,10 @@ def get_data_cube(
         raise TypeError("EPSG must be an integer.")
     if dt_delta is not None and not isinstance(dt_delta, int):
         raise TypeError("dt_delta must be an integer or None.")
+    if start_date is not None and not isinstance(start_date, str):
+        raise TypeError("start_date must be a string or None")
+    if end_date is not None and not isinstance(end_date, str):
+        raise TypeError("start_date must be a string or None")
     if not isinstance(engine, str):
         raise TypeError("engine must be a string.")
     if shape is not None:
@@ -188,7 +198,14 @@ def get_data_cube(
 
     # Set chunking and preprocessing parameters
     chunks = {'mid_date': -1, 'x': 'auto', 'y': 'auto'}
-    preprocess = partial(_preprocess, shape=shape, epsg=epsg, dt_delta=dt_delta)
+    preprocess = partial(
+        _preprocess, 
+        shape=shape, 
+        epsg=epsg, 
+        dt_delta=dt_delta, 
+        start_date=start_date,
+        end_date=end_date
+    )
 
     # Open datasets and process
     dc = xr.open_mfdataset(
@@ -217,6 +234,8 @@ def _preprocess(
     shape: gpd.GeoDataFrame = None, 
     epsg: int = 3031,
     dt_delta: int = None,
+    start_date = None,
+    end_date = None
 ) -> xr.Dataset:
     """
     Preprocess ITS_LIVE velocity data cubes before concatenation.
@@ -238,6 +257,10 @@ def _preprocess(
         EPSG code for the CRS. Defaults to 3031.
     dt_delta : int, optional
         Maximum allowed time difference (in days) for image pairs. If None, no filtering is applied.
+    start_date : string, optional
+        First date to include data in the dataset. Default is None (beginning of record).
+    end_date : string, optional
+        Last date to include in dataset. Default is None (most recent image)
 
     Returns
     -------
@@ -245,17 +268,25 @@ def _preprocess(
         Preprocessed xarray Dataset.
     """
     ## TODO: 
-    ## add selection by date
     ## figure out single satellite selection
+
+    # Filter by start and end date if specified
+    if start_date is not None:
+        start_date = np.datetime64(start_date)
+        ds = ds.where(ds.mid_date >= start_date, drop=True)
     
-    # Select relevant velocity variables
-    ds = ds[['vx', 'vy', 'v']]
+    if end_date is not None:
+        end_date = np.datetime64(end_date)
+        ds = ds.where(ds.mid_date <= end_date, drop=True)
 
     # Filter by time delta if dt_delta is specified
     if dt_delta is not None:
         time_threshold_ns = np.timedelta64(dt_delta, 'D')
         ds = ds.where(ds.date_dt <= time_threshold_ns)
 
+    # Select relevant velocity variables
+    ds = ds[['vx', 'vy', 'v']]
+    
     # Clip to GeoDataFrame if provided
     if shape is not None:
         ds = ds.rio.write_crs(f"EPSG:{epsg}")
