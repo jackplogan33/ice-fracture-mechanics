@@ -932,47 +932,37 @@ def apply_med_filt(arr, size=3):
 
 ##################################################################################
 
-def plot_monthly_failure_tau(ds, figsize, fname=None):
-    for i in range(len(ds.mid_date)):
-        fig, axs = plt.subplots(ncols=4, figsize=figsize, layout='constrained')
-        
-        mu = 0.03
-        x = ((2 * ds.tau_xx[i]) + ds.tau_yy[i]) * (1 - mu)
-        y = ((2 * ds.tau_yy[i]) + ds.tau_xx[i]) * (1 + mu)
-        c = ds.fracture_conf[i]
-        
-        axs[0].scatter(x=x, y=y, c=c, cmap='viridis', vmax=1)
-        axs[0].set_xlim([-1500,1500])
-        axs[0].set_xlabel('Principle stress 1 [kPa]')
-        axs[0].set_ylim([-1500,1500])
-        axs[0].set_ylabel('Principle stress 2 [kPa]')
-        axs[0].hlines(0, xmin=-1500, xmax=1500, color='black')
-        axs[0].vlines(0, ymin=-1500, ymax=1500, color='black')
-        axs[0].grid()
-        
-        ds.tau_xx[i].plot(ax=axs[1], vmin=-750, vmax=750, cmap='RdBu_r')
-        ds.tau_yy[i].plot(ax=axs[2], vmin=-750, vmax=750, cmap='RdBu_r')
-        ds.fracture_conf[i].plot(ax=axs[3], vmax=1)
-        
-        titles = ['Failure Map', 'Principle Stress 1', 'Principle Stress 2', 'Fracture Confidence']
-        for ax, title in zip(axs, titles):
-            ax.set_aspect('equal')
-            ax.set_title(title)
-
-        plt.suptitle(f'{ds.mid_date[i].data}')
-
-        if isinstance(fname, str):
-            plt.savefig(f'../figures/gif-pngs/{fname}-{i}.png', bbox_inches='tight')
-        
-        plt.show()
-
-    if isinstance(fname, str):
-        images = []
-        for i in range(len(ds.mid_date)):
-            image = Image.open(f'../figures/gif-pngs/{fname}-{i}.png')
-            images.append(image)
-        # Save as GIF with each frame
-        imageio.mimsave(f'../figures/{fname}.gif', images, duration=750)
+def plot_arrows(xs, ys, ax):
+    '''
+    Plotting function that plots the direction arrows for the parcel location
+    produced by bit.parcel_strain_stress().
+    '''
+    xs = np.array(xs)
+    ys = np.array(ys)
+    
+    # Sample points for arrows (e.g., every 10th point)
+    arrow_indices = np.arange(2, len(xs)-1, 5)  # Avoid including the last index
+    x_arrows = xs[arrow_indices]
+    y_arrows = ys[arrow_indices]
+    # Compute direction vectors for arrows (using np.diff to calculate directional vectors)
+    dx = np.diff(xs)  # Differences in x
+    dy = np.diff(ys)  # Differences in y
+    directions = np.sqrt(dx**2 + dy**2)  # Magnitudes of direction vectors
+    
+    # Normalize the direction vectors
+    dx = dx / directions
+    dy = dy / directions
+    
+    # Align direction vectors with sampled arrow positions
+    dx_arrows = dx[arrow_indices]  # Aligning with arrow positions
+    dy_arrows = dy[arrow_indices]  # Aligning with arrow positions
+    
+    # Plot the line
+    ax.plot(xs, ys, color='white', label='Parcel path')
+    
+    # Add arrows using quiver
+    ax.quiver(x_arrows, y_arrows, dx_arrows, dy_arrows, 
+               angles='uv', scale_units='xy', width=.05, color='white')
 
 ##################################################################################
 
