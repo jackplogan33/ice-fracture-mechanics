@@ -15,6 +15,7 @@ from scipy import ndimage
 import shapely.geometry
 
 import dask
+from dask.delayed import delayed
 dask.config.set(**{'array.slicing.split_large_chunks': False})
 
 ##################################################################################
@@ -196,8 +197,7 @@ def get_data_cube(
         if not all(isinstance(url, str) for url in urls):
             raise ValueError("All items in URLs must be strings.")
 
-    # Set chunking and preprocessing parameters
-    chunks = {'mid_date': -1, 'x': 'auto', 'y': 'auto'}
+    # Set and preprocessing parameters
     preprocess = partial(
         _preprocess, 
         shape=shape, 
@@ -207,22 +207,21 @@ def get_data_cube(
         end_date=end_date
     )
 
+    # Set and preprocessing parameters
     # Open datasets and process
     dc = xr.open_mfdataset(
         urls,
         engine=engine,
         preprocess=preprocess,
-        chunks=chunks,
+        chunks={'x':200, 'y':200},
         combine='nested',
         concat_dim='mid_date'
     )
-
-    # Sort and resample data
+        
     dc = (
         dc.sortby('mid_date')
         .resample(mid_date='1ME')  # '1ME' means month-end frequency
-        .mean(dim='mid_date', skipna=True)
-        .chunk('auto')
+        .mean(dim='mid_date', skipna=True, method='cohorts', engine='flox')  # flox keyword
     )
 
     return dc
@@ -285,7 +284,7 @@ def _preprocess(
         ds = ds.where(ds.date_dt <= time_threshold_ns)
 
     # Select relevant velocity variables
-    ds = ds[['vx', 'vy', 'v']]
+    ds = ds[['vx', 'vy']]
     
     # Clip to GeoDataFrame if provided
     if shape is not None:
@@ -293,7 +292,7 @@ def _preprocess(
         ds = ds.rio.clip(shape.geometry, shape.crs)
 
     # Sort by mid_date
-    return ds.sortby('mid_date')
+    return ds
     
 ##################################################################################
 
@@ -495,9 +494,12 @@ def sg_ufunc(arr, window_length, polyorder, deriv, axis):
     """
     Applies Savitzky-Golay filter via xarray's apply_ufunc.
     """
+    kwargs={'window_length':window_length, 'polyorder':polyorder, 'deriv':deriv, 'axis':axis}
     filt_arr = xr.apply_ufunc(
         sg, arr,
-        kwargs={'window_length':window_length, 'polyorder':polyorder, 'deriv':deriv, 'axis':axis}
+        kwargs=kwargs,
+        dask='parallelized',
+        output_dtypes=['float32']
     )
     return filt_arr
 
@@ -786,7 +788,7 @@ def parcel_strain_stress(
     
     # If steps forward not given, go as many steps forward as possible
     if steps_forward is None:
-        steps_forward = length - start_index
+        steps_forward = (length - start_index) - 1
     
     # If no steps reversed given, set to 0
     if steps_reverse is None:
@@ -795,53 +797,57 @@ def parcel_strain_stress(
     # Define start and end index
     first_step = start_index - steps_reverse
     final_step = start_index + steps_forward
-
+    
     if first_step < 0:
         raise ValueError("Too many steps reverse. Decrease the number of timesteps")
-
+    
     if final_step > len(ds.mid_date):
         raise ValueError("Too many steps forward. Decrease the number of timesteps")
     
     # Define points array for move_points func
     point = np.c_[x, y]
-
+    
     points_f = point.copy()
     
     # Add initial pt to forward step
-    for i in range(steps_forward):
+    for i in range(steps_forward-1):
         point = move_points(point, (start_index+i), ds)
         points_f = np.vstack((points_f, point))
     
     point = np.c_[x, y]
     points_rev = np.empty((0,2))
-    for i in range(steps_reverse):
+    for i in range(0, steps_reverse):
         point = move_points(point, (start_index-i), ds, reverse_direction=True)
         points_rev = np.vstack((points_rev, point))
     
     points = np.vstack((points_rev[::-1], points_f))
     
     # Initialize list for selection of dfs for each point
-    point_vals = []
-    progress_bar = tqdm(range(first_step, final_step), desc="Tracking Parcel")
-    
+    point_vals = []    
     for i, time_index in enumerate(range(first_step, final_step)):
-        x, y = points[i]
-        
+        x, y = points[i]  # Grab point at time index
+    
         parcel = ds.sel(x=slice(x-buffer, x+buffer), y=slice(y-buffer, y+buffer)).mean(['x','y'], skipna=True)
         point_vals.append(parcel.isel(mid_date=time_index))
-        progress_bar.update(1)
-
-    progress_bar.close()
+    
+    # concat  list of points
     point_srs = xr.concat(point_vals, dim='mid_date')
+    
+    # Compute total strain using cumulative sum
     strain = point_srs[['effective', 'eps_xx', 'eps_yy']].cumsum(dim='mid_date')
     strain = strain.rename_vars({'effective':'effective_strain','eps_xx':'e_xx', 'eps_yy':'e_yy'})
     
+    # Add strain vars to dataset
     parcel = xr.merge([point_srs, strain])
-
+    
+    # Apply median filter
     if filtersize:
         parcel = apply_med_filt(parcel, filtersize)
+    
+    # Add x- and y-coordinates to dataset at function of mid_date
+    parcel[['x', 'y']] = [(('mid_date'), points.T[0]), (('mid_date'), points.T[1])]
 
-    return parcel, points
+    return parcel
 
 ##################################################################################
 
