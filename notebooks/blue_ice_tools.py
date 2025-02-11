@@ -788,7 +788,7 @@ def parcel_strain_stress(
     
     # If steps forward not given, go as many steps forward as possible
     if steps_forward is None:
-        steps_forward = (length - start_index) - 1
+        steps_forward = (length - start_index)
     
     # If no steps reversed given, set to 0
     if steps_reverse is None:
@@ -935,6 +935,126 @@ def apply_med_filt(arr, size=3):
         arr,
         kwargs={'size':size}
     )
+
+##################################################################################
+
+def calc_stress_change(parcel_ds, ds, radius):
+    """
+    Computes the change in stress metrics over time within a circular region.
+
+    This function iterates through time steps in `parcel_ds`, extracting a 
+    circular region of radius `radius` for each time step and computing the 
+    difference in stress metrics (`sigma1`, `sigma2`, and `von_mises stress`) 
+    between consecutive time steps.
+
+    The computed stress changes are stored in a new `xarray.Dataset`.
+
+    Args:
+        parcel_ds (xarray.Dataset): 
+            A dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
+        ds (xarray.Dataset): 
+            The dataset containing stress values (`sigma1`, `sigma2`, `von_mises`, `fracture_conf`), 
+            indexed by `mid_date`, `x`, and `y`.
+        radius (float): 
+            The radius of the circular region for stress analysis.
+
+    Returns:
+        xarray.Dataset: 
+            A new dataset containing:
+            - `delta_P1`: Change in Principal Stress 1 (sigma1) over time.
+            - `delta_P2`: Change in Principal Stress 2 (sigma2) over time.
+            - `delta_VM`: Change in von Mises stress over time.
+            - `fracture_conf`: Fracture confidence values at each time step.
+            
+            The dataset is indexed by `mid_date`, `y`, and `x`, with coordinates for 
+            `x` and `y` varying per time step.
+
+    Example:
+        >>> stress_dataset = calc_stress_change(parcel_ds, ds, radius=10)
+        >>> stress_dataset
+        <xarray.Dataset>
+        Dimensions:       (mid_date: N, y: M, x: L)
+        Coordinates:
+            mid_date     (mid_date) datetime64[ns] ...
+            x           (mid_date, x) float32 ...
+            y           (mid_date, y) float32 ...
+        Data variables:
+            delta_P1     (mid_date, y, x) float32 ...
+            delta_P2     (mid_date, y, x) float32 ...
+            delta_VM     (mid_date, y, x) float32 ...
+            fracture_conf (mid_date, y, x) float32 ...
+    """
+    p_i = None  # initialize previous step as empty
+    
+    # Prepare dictionaries for data storage
+    var_names = ['delta_P1', 'delta_P2', 'delta_VM', 'fracture_conf']
+    parcel_dict = {var:(('mid_date','y','x'),[]) for var in var_names}
+    
+    coords = {'mid_date':[], 'x':(('mid_date', 'x'),[]), 'y':(('mid_date', 'y'),[])}
+    for t in parcel_ds.mid_date:
+        # Grab circular region at t
+        p_n, x_coords, y_coords = extract_circular_region(parcel_ds, ds, t, radius)
+
+        # If previous (x, y) exists:
+        if p_i:
+            # Calculcate change in stressed, store in dict
+            parcel_dict['delta_P1'][1].append(p_n.sigma1.to_numpy() - p_i.sigma1.to_numpy())
+            parcel_dict['delta_P2'][1].append(p_n.sigma2.to_numpy() - p_i.sigma2.to_numpy())
+            parcel_dict['delta_VM'][1].append(p_n.von_mises.to_numpy() - p_i.von_mises.to_numpy())
+            parcel_dict['fracture_conf'][1].append(p_n.fracture_conf.to_numpy())
+
+            # Store coordinate data
+            coords['mid_date'].append(t.data)
+            coords['x'][1].append(x_coords)
+            coords['y'][1].append(y_coords)
+        
+        # Save copy of current frame as previous frame
+        p_i = p_n.copy()
+
+    return xr.Dataset(data_vars=parcel_dict, coords=coords)
+
+##################################################################################
+
+def extract_circular_region(parcel_ds, ds, t, r):
+    """
+    Extracts a circular region of radius `r` centered at (x, y) from a dataset at a given time `t`.
+
+    This function first extracts a square region around (x, y) using `slice()`, 
+    then applies a circular mask to retain only points within the specified radius.
+
+    Args:
+        parcel_ds (xarray.Dataset): 
+            A dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
+        ds (xarray.Dataset): 
+            The main dataset from which a circular subset will be extracted. Must have `x` and `y` as coordinates.
+        t (datetime-like or str): 
+            The timestamp at which to extract the circular region.
+        r (float): 
+            The radius of the circular region (in dataset coordinate units).
+
+    Returns:
+        tuple:
+            - xarray.Dataset: The subset of `ds` within the circular region.
+            - numpy.ndarray: The x-coordinates of the extracted region.
+            - numpy.ndarray: The y-coordinates of the extracted region.
+    """
+    # grab (x, y) center
+    x = parcel_ds.x.sel(mid_date=t).item()
+    y = parcel_ds.y.sel(mid_date=t).item()
+    
+    # Grab square region around (x, y)
+    ds = ds.sel(mid_date=t, x=slice(x - r, x + r), y=slice(y - r, y + r))
+    
+    # Compute distances from center
+    # x_coords, y_coords = np.meshgrid(ds.x.data, ds.y.data, indexing="xy")
+    # distances = np.sqrt((x_coords - x.data)**2 + (y_coords - y.data)**2)
+    distances = np.sqrt((ds.x.values[:, np.newaxis] - x)**2 + (ds.y.values[np.newaxis, :] - y)**2)
+
+    # Save distance from (x, y) as variable in dataset
+    ds['radii'] = (('y', 'x'), distances)
+    ds = ds.where(ds.radii <= r)
+    
+    return ds, ds.x.values, ds.y.values
 
 ##################################################################################
 
