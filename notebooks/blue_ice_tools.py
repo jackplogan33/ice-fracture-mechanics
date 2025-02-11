@@ -13,7 +13,9 @@ from shapely.geometry import Polygon
 from shapely.geometry import Point
 from scipy import ndimage
 import shapely.geometry
+import imageio.v2 as imageio
 
+import os
 import dask
 from dask.delayed import delayed
 dask.config.set(**{'array.slicing.split_large_chunks': False})
@@ -940,49 +942,59 @@ def apply_med_filt(arr, size=3):
 
 def calc_stress_change(parcel_ds, ds, radius):
     """
-    Computes the change in stress metrics over time within a circular region.
+    Compute stress changes over time within a circular region.
 
-    This function iterates through time steps in `parcel_ds`, extracting a 
-    circular region of radius `radius` for each time step and computing the 
-    difference in stress metrics (`sigma1`, `sigma2`, and `von_mises stress`) 
-    between consecutive time steps.
+    This function iterates through all time steps in `parcel_ds`, extracting a 
+    circular region of radius `radius` centered on `(x, y)` at each time step. 
+    It computes the differences in stress metrics (`sigma1`, `sigma2`, `von_mises stress`) 
+    between consecutive time steps and returns them in a new `xarray.Dataset`.
 
-    The computed stress changes are stored in a new `xarray.Dataset`.
+    Parameters
+    ----------
+    parcel_ds : xarray.Dataset
+        Dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
+    ds : xarray.Dataset
+        Dataset containing stress values (`sigma1`, `sigma2`, `von_mises`, `fracture_conf`), 
+        indexed by `mid_date`, `x`, and `y`.
+    radius : float
+        The radius of the circular region for stress analysis (in dataset coordinate units).
 
-    Args:
-        parcel_ds (xarray.Dataset): 
-            A dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
-        ds (xarray.Dataset): 
-            The dataset containing stress values (`sigma1`, `sigma2`, `von_mises`, `fracture_conf`), 
-            indexed by `mid_date`, `x`, and `y`.
-        radius (float): 
-            The radius of the circular region for stress analysis.
+    Returns
+    -------
+    xarray.Dataset
+        A dataset containing:
+        
+        - `delta_P1` : (mid_date, y, x) Change in Principal Stress 1 (`sigma1`) over time.
+        - `delta_P2` : (mid_date, y, x) Change in Principal Stress 2 (`sigma2`) over time.
+        - `delta_VM` : (mid_date, y, x) Change in von Mises stress over time.
+        - `fracture_conf` : (mid_date, y, x) Fracture confidence values at each time step.
 
-    Returns:
-        xarray.Dataset: 
-            A new dataset containing:
-            - `delta_P1`: Change in Principal Stress 1 (sigma1) over time.
-            - `delta_P2`: Change in Principal Stress 2 (sigma2) over time.
-            - `delta_VM`: Change in von Mises stress over time.
-            - `fracture_conf`: Fracture confidence values at each time step.
-            
-            The dataset is indexed by `mid_date`, `y`, and `x`, with coordinates for 
-            `x` and `y` varying per time step.
+        The dataset is indexed by `mid_date`, `y`, and `x`, with coordinates for 
+        `x` and `y` varying per time step.
 
-    Example:
-        >>> stress_dataset = calc_stress_change(parcel_ds, ds, radius=10)
-        >>> stress_dataset
-        <xarray.Dataset>
-        Dimensions:       (mid_date: N, y: M, x: L)
-        Coordinates:
-            mid_date     (mid_date) datetime64[ns] ...
-            x           (mid_date, x) float32 ...
-            y           (mid_date, y) float32 ...
-        Data variables:
-            delta_P1     (mid_date, y, x) float32 ...
-            delta_P2     (mid_date, y, x) float32 ...
-            delta_VM     (mid_date, y, x) float32 ...
-            fracture_conf (mid_date, y, x) float32 ...
+    Notes
+    -----
+    - The function requires `extract_circular_region` to define the extraction method.
+    - The first time step does not have a corresponding `delta_*` value since differences 
+      are computed between consecutive frames.
+    
+    Examples
+    --------
+    Compute the stress change over time for a given dataset:
+    
+    >>> stress_dataset = calc_stress_change(parcel_ds, ds, radius=10)
+    >>> stress_dataset
+    <xarray.Dataset>
+    Dimensions:       (mid_date: N, y: M, x: L)
+    Coordinates:
+        mid_date     (mid_date) datetime64[ns] ...
+        x           (mid_date, x) float32 ...
+        y           (mid_date, y) float32 ...
+    Data variables:
+        delta_P1     (mid_date, y, x) float32 ...
+        delta_P2     (mid_date, y, x) float32 ...
+        delta_VM     (mid_date, y, x) float32 ...
+        fracture_conf (mid_date, y, x) float32 ...
     """
     p_i = None  # initialize previous step as empty
     
@@ -1017,26 +1029,54 @@ def calc_stress_change(parcel_ds, ds, radius):
 
 def extract_circular_region(parcel_ds, ds, t, r):
     """
-    Extracts a circular region of radius `r` centered at (x, y) from a dataset at a given time `t`.
+    Extract a circular region of radius `r` centered at (x, y) from a dataset at a given time `t`.
 
-    This function first extracts a square region around (x, y) using `slice()`, 
+    This function first extracts a square bounding box around (x, y) using `slice()`, 
     then applies a circular mask to retain only points within the specified radius.
 
-    Args:
-        parcel_ds (xarray.Dataset): 
-            A dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
-        ds (xarray.Dataset): 
-            The main dataset from which a circular subset will be extracted. Must have `x` and `y` as coordinates.
-        t (datetime-like or str): 
-            The timestamp at which to extract the circular region.
-        r (float): 
-            The radius of the circular region (in dataset coordinate units).
+    Parameters
+    ----------
+    parcel_ds : xarray.Dataset
+        Dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
+    ds : xarray.Dataset
+        The main dataset from which a circular subset will be extracted. Must have `x` and `y` as coordinates.
+    t : datetime-like or str
+        The timestamp at which to extract the circular region.
+    r : float
+        The radius of the circular region (in dataset coordinate units).
 
-    Returns:
-        tuple:
-            - xarray.Dataset: The subset of `ds` within the circular region.
-            - numpy.ndarray: The x-coordinates of the extracted region.
-            - numpy.ndarray: The y-coordinates of the extracted region.
+    Returns
+    -------
+    tuple
+        - **xarray.Dataset** : The subset of `ds` within the circular region.
+        - **numpy.ndarray** : The x-coordinates of the extracted region.
+        - **numpy.ndarray** : The y-coordinates of the extracted region.
+
+    Notes
+    -----
+    - Uses a square bounding box (`x ± r`, `y ± r`) for an initial selection before applying the circular mask.
+    - The function assumes that `x` and `y` are scalar values and extracts them using `.item()`.
+
+    Examples
+    --------
+    Extract a circular region from a dataset for a given timestamp:
+    
+    >>> region, x_coords, y_coords = extract_circular_region(parcel_ds, ds, "2024-01-01", r=10)
+    >>> region
+    <xarray.Dataset>
+    Dimensions:  (x: 20, y: 20)
+    Coordinates:
+        x        (x) float32 ...
+        y        (y) float32 ...
+    Data variables:
+        sigma1   (y, x) float32 ...
+        sigma2   (y, x) float32 ...
+        von_mises (y, x) float32 ...
+        fracture_conf (y, x) float32 ...
+    
+    >>> x_coords.shape, y_coords.shape
+    ((20,), (20,))
+
     """
     # grab (x, y) center
     x = parcel_ds.x.sel(mid_date=t).item()
@@ -1046,8 +1086,6 @@ def extract_circular_region(parcel_ds, ds, t, r):
     ds = ds.sel(mid_date=t, x=slice(x - r, x + r), y=slice(y - r, y + r))
     
     # Compute distances from center
-    # x_coords, y_coords = np.meshgrid(ds.x.data, ds.y.data, indexing="xy")
-    # distances = np.sqrt((x_coords - x.data)**2 + (y_coords - y.data)**2)
     distances = np.sqrt((ds.x.values[:, np.newaxis] - x)**2 + (ds.y.values[np.newaxis, :] - y)**2)
 
     # Save distance from (x, y) as variable in dataset
@@ -1089,6 +1127,146 @@ def plot_arrows(xs, ys, ax):
     # Add arrows using quiver
     ax.quiver(x_arrows, y_arrows, dx_arrows, dy_arrows, 
                angles='uv', scale_units='xy', width=.05, color='white')
+
+##################################################################################
+
+def plot_parcel_change(
+    ds, 
+    parcel_ds, 
+    radius, 
+    gif_path, 
+    figsize=(14,10),
+    delete_pngs=True
+):
+    """
+    Generates a GIF visualizing stress changes and fracture confidence over time 
+    for a circular region around a parcel.
+
+    This function iterates through all timesteps, creating 2x2 subplots per frame 
+    that display the fracture confidence, von Mises stress, and principal stresses 
+    (P1 and P2). It also overlays the parcel's movement with an arrow and saves 
+    the frames as PNG images before compiling them into an animated GIF.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset containing stress change variables (`delta_VM`, `delta_P1`, `delta_P2`, `fracture_conf`).
+    parcel_ds : xarray.Dataset
+        Dataset containing parcel location coordinates (`x`, `y`).
+    radius : float
+        Radius of the circular region around the parcel in dataset coordinate units.
+    gif_path : str
+        File path where the output GIF will be saved.
+    figsize : tuple of float, optional
+        Figure size for each frame in inches (default is (14, 10)).
+    delete_pngs : bool, optional
+        If True, deletes the temporary PNG files after the GIF is created (default is True).
+
+    Notes
+    -----
+    - The function automatically scales the colorbars based on the dataset's minimum 
+      and maximum stress values.
+    - Uses `tqdm` to display progress bars for frame generation, GIF creation, and cleanup.
+
+    Raises
+    ------
+    FileNotFoundError
+        If an expected PNG file is missing during deletion.
+
+    Examples
+    --------
+    Generate a GIF of stress changes with a radius of 500 meters:
+
+    >>> plot_parcel_change(ds, parcel_ds, radius=500, gif_path='stress_change.gif')
+
+    Keep the intermediate PNGs for debugging:
+
+    >>> plot_parcel_change(ds, parcel_ds, radius=500, gif_path='stress_change.gif', delete_pngs=False)
+    """
+    # Calculate maximum change for cbar
+    max_VM = max(abs(ds.delta_VM.min()), abs(ds.delta_VM.max()))
+    max_P1 = max(abs(ds.delta_P1.min()), abs(ds.delta_P1.max()))
+    max_P2 = max(abs(ds.delta_P2.min()), abs(ds.delta_P2.max()))
+
+    img_filenames = []
+    
+    data_vars = ['fracture_conf', 'delta_VM', 'delta_P1', 'delta_P2']
+    titles = ['Fracture Confidence', 'Von Mises', 'Principal Stress 1', 'Principal Stress 2']
+    cmaps = ['viridis', 'coolwarm', 'coolwarm', 'coolwarm']
+    cbar_labels = [
+        'Fracture Confidence [0:1]', 
+        '$\Delta \sigma_{VM}$ [kPa]', 
+        '$\Delta \sigma_{1}$ [kPa]', 
+        '$\Delta \sigma_{2}$ [kPa]'
+    ]
+    min_max = [(0,1), (-max_VM, max_VM), (-max_P1, max_P1), (-max_P2, max_P2)]
+
+    for t in tqdm(range(len(ds.mid_date)), desc="Generating Frames"):
+        fig, axs = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+        axs = axs.flatten()
+
+        for ax, data_var, (vmin, vmax), cmap, title, cbar_label in zip(axs, data_vars, min_max, cmaps, titles, cbar_labels):
+            # Plot data variable with 
+            ds[data_var][t].plot(
+                ax=ax, vmin=vmin, vmax=vmax, cmap=cmap, cbar_kwargs={'label':cbar_label}
+            )
+            
+            # Grab (x, y) for timestep
+            x = parcel_ds.x[t+1]
+            y = parcel_ds.y[t+1]
+
+            # (x, y) in the next timestep for arrow displacement
+            if t + 2 < len(parcel_ds.mid_date):
+                dx, dy = parcel_ds.x[t+2] - x, parcel_ds.y[t+2] - y
+            else:
+                dx, dy = 0, 0  # No displacement for last timestep
+
+            # Plot reference point and flow direction
+            ax.arrow(x, y, dx, dy, width=20, color='k', label='Flow Direction')
+            ax.scatter(x, y, c='r', ec='k', s=150, label='Reference Point')
+            ax.grid(ls='--', color='grey', alpha=0.5)
+
+            # Set subplot texts
+            ax.set_title(title, fontsize=16)
+            ax.set_xlabel('x [meters]')    
+            ax.set_ylabel('y [meters]')
+            ax.set_xticks(ds.x[t].values[::4])
+            ax.set_yticks(ds.y[t].values[::4])
+
+            # Adjust subplot limits and aspect
+            ax.set_xlim(x-(radius+200), x+(radius+200))
+            ax.set_ylim(y-(radius+200), y+(radius+200))
+            ax.set_aspect('equal')
+            ax.legend()
+
+        # Title the figure, adjust layout to tight
+        date1 = np.datetime64(parcel_ds.mid_date[t].data, 'D')
+        date2 = np.datetime64(parcel_ds.mid_date[t+1].data, 'D')
+        date_label = f"Change from {date1} to {date2}"
+        
+        plt.suptitle(date_label, fontsize=20, weight='bold')
+
+        # Save then close figure
+        filename = gif_path + f'{t}.png'
+        plt.savefig(filename, dpi=150)
+        img_filenames.append(filename)
+
+        plt.close()
+
+    # Generate GIF with progress bar
+    with imageio.get_writer(gif_path, duration=1000, loop=0, palettesize=32) as writer:
+        for filename in tqdm(img_filenames, desc="Creating GIF"):
+            writer.append_data(imageio.imread(filename))
+        
+    # Remove PNGs if delete_pngs is True
+    if delete_pngs:
+        for filename in tqdm(img_filenames, desc="Deleting PNGs"):
+            try:
+                os.remove(filename)
+            except FileNotFoundError:
+                print(f"Warning: {filename} not found, skipping deletion.")
+
+    print(f"GIF saved at: {gif_path}")
 
 ##################################################################################
 
