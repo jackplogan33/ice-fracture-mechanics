@@ -5,7 +5,7 @@ import numpy as np
 import xarray as xr
 import rioxarray as rxr
 import dask.array as da
-import pands as pd
+import pandas as pd
 import geopandas as gpd
 
 from shapely.geometry import Point, Polygon
@@ -76,7 +76,7 @@ class GlacierDataProcessor:
         self.start_date = start_date
         self.end_date = end_date
         self.chunks = chunks
-        self.dataset = self.get_data_cube()
+        self.dataset = None
 
         # Define stress and strain variables
         self.dx = 120
@@ -150,11 +150,16 @@ class GlacierDataProcessor:
 
     def get_data_cube(
         self,
+        urls: str | list | np.ndarray = None,
+        engine: str = 'zarr',
         dt_delta: float = 18,
         start_date: str | np.datetime64 = "2018-07-01",
         end_date: str | np.datetime64 = "2023-01-31",
         chunks: str | dict = 'auto',
     ):
+        if urls is None:
+            urls = self.urls
+            
         preprocess = partial(
             _preprocess, 
             shape=self.shape,
@@ -165,8 +170,8 @@ class GlacierDataProcessor:
         )
 
         self.dataset = xr.open_mfdataset(
-            self.urls,
-            engine='zarr',
+            urls,
+            engine=engine,
             preprocess=preprocess,
             chunks=chunks,
             combine='nested',
@@ -178,6 +183,9 @@ class GlacierDataProcessor:
             .resample(mid_date='1ME')
             .mean(dim='mid_date', skipna=True, method='cohorts', engine='flox')
         ).chunk({'x':100, 'y':100, 'mid_date':-1})
+
+        self.dx = self.dataset.x.diff('x')[0].item()
+        self.dy = self.dataset.y.diff('y')[0].item()
         
         return self.dataset
     
@@ -243,6 +251,18 @@ class GlacierDataProcessor:
 
         return self.dataset
 
+    def merge_and_compute(
+        self, 
+        fracture_path='../data/shirase-glacier/shirase-fracture-clipped.nc',
+        compute=True
+    ):
+        frac_ds = xr.open_dataset(fracture_path)
+        self.dataset = xr.merge([self.dataset, frac_ds])
+
+        if compute:
+            self.dataset = self.dataset.compute()
+        return self.dataset
+
 ##################################################################################
 
 class LagrangianTracking:
@@ -277,9 +297,9 @@ class LagrangianTracking:
     def __init__(self, dataset, epsg=3031):
         self.dataset = dataset
         self.epsg = epsg
-        self.tracked_parcels = {}       # Store results for multiple parcels
-        self.tracked_polygons = {}      # Store results for multiple polygons
-        self.tracked_change_areas = {}  # Store results for multiple circular regions
+        self.polygons = []      # Store results for multiple polygons
+        self.parcels = []       # Store results for multiple parcels
+        self.change_areas = []  # Store results for multiple circular regions
 
     def move_points(
         self,
@@ -365,6 +385,8 @@ class LagrangianTracking:
           subsequent frames.
         - The dataset may include spatial attributes like `fracture_conf` for more nuanced operations during tracking.
         """
+        polygon = Polygon()
+        self.polygons.append()
         result = self._track_polygon(polygon, **kwargs)
         self.tracked_polygons[polygon_id] = result
         return result
@@ -483,7 +505,7 @@ class LagrangianTracking:
         lagrange_frame = xr.concat(clipped_frames, dim='mid_date')
         return apply_med_filt(lagrange_frame, size=filtersize) if filtersize is not None else lagrange_frame
 
-    def track_parcel(self, parcel_id, x, y, **kwargs):
+    def track_parcel(self, parcel_id, x, y, track_change_around=False, radius=1200, **kwargs):
         """
         Computes the time-series values for a parcel moving across a domain over time. 
         The function integrates strain rate to compute the total strain experienced by the parcel 
@@ -506,7 +528,12 @@ class LagrangianTracking:
             The number of timesteps to move backward in time. Defaults to 0.
         filtersize : int, optional
             The size of the median filter applied to smooth the output dataset. Default is None, meaning no filtering.
-    
+        track_change_around : bool, optional
+            Calls `change_around_parcel` natively to grab regions around a parcel and calculate the change in stress
+            for each month. Must pass radius if True
+        radius : float, optional
+            The radius of the circular region for stress analysis (in dataset coordinate units).
+
         Returns
         -------
         parcel : xr.Dataset
@@ -535,7 +562,10 @@ class LagrangianTracking:
         """
         result = self._track_parcel(x, y, **kwargs)
         self.tracked_parcels[parcel_id] = result
-        return result
+
+        change_result = self.change_around_parcel(parcel_id, radius)
+        
+        return result, change_result
     
     def _track_parcel(
         self,
@@ -545,7 +575,7 @@ class LagrangianTracking:
         start_index: int = None,
         steps_forward: int = None,
         steps_reverse: int = None,
-        filtersize: int = None
+        filtersize: int = None,
     ) -> xr.Dataset:
         """
         Internal method to track a parcel by moving it over time.
@@ -641,7 +671,7 @@ class LagrangianTracking:
     
         return parcel
 
-    def change_around_parcel(self, parcel_id, x, y, r, **kwargs):
+    def change_around_parcel(self, parcel_id, r, **kwargs):
         """
         Compute stress changes over time within a circular region.
     
@@ -652,11 +682,8 @@ class LagrangianTracking:
     
         Parameters
         ----------
-        parcel_ds : xarray.Dataset
+        parcel_id : xarray.Dataset
             Dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
-        ds : xarray.Dataset
-            Dataset containing stress values (`sigma1`, `sigma2`, `von_mises`, `fracture_conf`), 
-            indexed by `mid_date`, `x`, and `y`.
         radius : float
             The radius of the circular region for stress analysis (in dataset coordinate units).
     
@@ -679,27 +706,23 @@ class LagrangianTracking:
         - The first time step does not have a corresponding `delta_*` value since differences 
           are computed between consecutive frames.
         """
-        result = self._change_around_parcel(x, y, r, **kwargs)
+        result = self._change_around_parcel(parcel_id, r, **kwargs)
         self.tracked_change_areas[parcel_id] = result
         return result
     
     def _change_around_parcel(
         self, 
-        x: int | float,
-        y: int | float,
+        parcel_id: str,
         radius: int | float,
-        start_index: int = None,
-        steps_forward: int = None,
-        steps_reverse: int = None,
-        filtersize: int = None
     ) -> xr.Dataset:
-        
-        parcel_ds = self._track_parcel(
-            x, y, 
-            start_index=start_index, 
-            steps_forward=steps_forward, 
-            steps_reverse=steps_reverse
-        )
+        """
+        Internal method to track change around a parcel by clipping areas around
+        different (x, y) points through time.
+        """
+        try:
+            parcel_ds = self.tracked_parcels[parcel_id]
+        except:
+            raise ValueError(f'Parcel {parcel_id} has not been tracked. Please call track_parcel() with this ID first.')
 
         p_i = None  # initialize previous step as empty
         
@@ -709,8 +732,12 @@ class LagrangianTracking:
         
         coords = {'mid_date':[], 'x':(('mid_date', 'x'),[]), 'y':(('mid_date', 'y'),[])}
         for t in parcel_ds.mid_date:
+            # grab (x, y) center
+            x = parcel_ds.x.sel(mid_date=t).item()
+            y = parcel_ds.y.sel(mid_date=t).item()
+
             # Grab circular region at t
-            p_n, x_coords, y_coords = self.extract_circular_region(parcel_ds, t, radius)
+            p_n, x_coords, y_coords = self._extract_circular_region(x, y, t, radius)
     
             # If previous (x, y) exists:
             if p_i:
@@ -730,40 +757,12 @@ class LagrangianTracking:
     
         return xr.Dataset(data_vars=parcel_dict, coords=coords)
 
-    def extract_circular_region(self, parcel_ds, t, r):
+    def _extract_circular_region(self, x, y, t, r):
         """
-        Extract a circular region of radius `r` centered at (x, y) from a dataset at a given time `t`.
-    
-        This function first extracts a square bounding box around (x, y) using `slice()`, 
-        then applies a circular mask to retain only points within the specified radius.
-    
-        Parameters
-        ----------
-        parcel_ds : xarray.Dataset
-            Dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
-        t : datetime-like or str
-            The timestamp at which to extract the circular region.
-        r : float
-            The radius of the circular region (in dataset coordinate units).
-    
-        Returns
-        -------
-        tuple
-            - **xarray.Dataset** : The subset of `ds` within the circular region.
-            - **numpy.ndarray** : The x-coordinates of the extracted region.
-            - **numpy.ndarray** : The y-coordinates of the extracted region.
-    
-        Notes
-        -----
-        - Uses a square bounding box (`x ± r`, `y ± r`) for an initial selection before applying the circular mask.
-        - The function assumes that `x` and `y` are scalar values and extracts them using `.item()`.
+        Internal method for collecting the circular region around an (x, y) point at a specific timestep
         """
         ds = self.dataset
-        
-        # grab (x, y) center
-        x = parcel_ds.x.sel(mid_date=t).item()
-        y = parcel_ds.y.sel(mid_date=t).item()
-        
+                
         # Grab square region around (x, y)
         ds = ds.sel(mid_date=t, x=slice(x - r, x + r), y=slice(y - r, y + r))
         
@@ -775,6 +774,36 @@ class LagrangianTracking:
         ds = ds.where(ds.radii <= r)
         
         return ds, ds.x.values, ds.y.values
+
+##################################################################################
+
+class TrackedObject:
+    """Base class for tracked objects."""
+    def __init__(self, id: str):
+        self.id = id
+        self.history = []
+
+    def add_state(self, state):
+        """Record a state in the tracking history."""
+        self.history.append(state)
+
+class Polygon(TrackedObject):
+    def __init__(self, polygon, start_index, steps_forward, steps_reverse):
+        self.polygon = polgon
+
+class Parcel(TrackedObject):
+    def __init__(self, x, y, start_index, steps_forward, steps_reverse):
+        self.x = x
+        self.y = y
+        self.start_index = start_index
+        self.steps_forward = steps_forward
+        self.steps_reverse = steps_reverse
+
+class ChangeArea(Parcel):
+    def __init__(self, radius):
+        self.radius = radius
+        self.stress_changes = []
+        self.x_coords = []
 
 ##################################################################################
 
