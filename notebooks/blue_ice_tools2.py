@@ -297,513 +297,128 @@ class LagrangianTracking:
     def __init__(self, dataset, epsg=3031):
         self.dataset = dataset
         self.epsg = epsg
-        self.polygons = []      # Store results for multiple polygons
-        self.parcels = []       # Store results for multiple parcels
-        self.change_areas = []  # Store results for multiple circular regions
+        self._polygons = {}      # Store objects for multiple polygons
+        self._parcels = {}       # Store objects for multiple parcels
 
-    def move_points(
-        self,
-        points, 
-        index,
-        reverse_direction=False,
-    ):
+    def track_polygon(self, id, polygon, **kwargs):
         """
-        Move points based on velocity fields at a given time index.
-
-        Parameters
-        ----------
-        points : list
-            A list of (x, y) coordinates representing points to be moved.
-        index : int
-            The time index in the dataset at which the velocity is applied.
-        reverse_direction : bool, optional
-            If True, moves points in the reverse direction of the velocity field. Default is False.
-
-        Returns
-        -------
-        list
-            Updated list of moved (x, y) points.
+        Creates and tracks a new polygon
         """
-        ds = self.dataset
-        updated_points = points.copy()
-    
-        for i, (x, y) in enumerate(updated_points):
-            # Fetch velocities at the nearest grid point
-            vx = ds.vx[index].sel(x=x, y=y, method="nearest").data
-            vy = ds.vy[index].sel(x=x, y=y, method="nearest").data
-    
-            # Handle NaN velocities by setting to zero
-            if np.isnan(vx): vx = 0
-            if np.isnan(vy): vy = 0
-    
-            # Apply velocity move; reverse direction if specified
-            factor = -1 if reverse_direction else 1
-            x += factor * (vx / 12)
-            y += factor * (vy / 12)
-    
-            updated_points[i] = [x, y]
-    
-        return updated_points
-
-    def track_polygon(self, polygon_id, polygon, **kwargs):
-        """
-        Tracks a moving polygonal feature over time within a spatial dataset, leveraging velocity data to predict changes 
-        in the feature's geometry.
-    
-        The function iteratively updates a given polygonal geometry to reflect its movement across time steps within an 
-        `xarray.Dataset`. The dataset is expected to contain velocity components (`vx` and `vy`) which guide the movement 
-        of the polygon. Additional parameters enable filtering of the dataset, handling of fracture points, and temporal 
-        movement both forward and backward.
-    
-        Parameters:
-        -----------
-        polygon : shapely.geometry.Polygon
-            A polygonal shape representing the feature of interest, used as the initial geometry for tracking.
-        start_index : int, optional
-            The time index to start the tracking process (default is 0, the first time step).
-        steps_forward : int, optional
-            The number of time steps to track forward in time. If `None`, all available time steps are processed.
-        steps_reverse : int, optional
-            The number of time steps to move backward from `start_index` to adjust the initial geometry. Defaults to `None`.
-        filtersize : int, optional
-            Size of the median filter applied to smooth the final output dataset (default is `None`, meaning no filtering).
-        remove_threshold : float, optional
-            A threshold value for fracture confidence. Points with fracture confidence below this threshold are removed.
-            If provided, it must be a float between 0 and 1 (default is `None`).
-    
-        Returns:
-        --------
-        xr.Dataset
-            A new dataset clipped to the geometry of the moving polygon across the specified time steps. The resulting
-            dataset may optionally include smoothed data if a `filtersize` is provided.
-
-        Notes:
-        ------
-        - The function employs a reverse tracking option (`steps_reverse`) to determine the starting position of the polygon.
-        - Polygon movement is guided by velocity fields in the dataset, and the new position is used for iterative clipping.
-        - If `remove_threshold` is provided, the function tracks and removes fracture points, ensuring they do not influence
-          subsequent frames.
-        - The dataset may include spatial attributes like `fracture_conf` for more nuanced operations during tracking.
-        """
-        polygon = Polygon()
-        self.polygons.append()
-        result = self._track_polygon(polygon, **kwargs)
-        self.tracked_polygons[polygon_id] = result
-        return result
-    
-    def _track_polygon(
-        self, 
-        polygon: Polygon,
-        start_index: int = 0,
-        steps_forward: int = None,
-        steps_reverse: int = None,
-        filtersize: float = None,
-        remove_threshold: int = None
-    ) -> xr.Dataset:
-        """
-        Internal method to track a polygon by moving its boundary points over time.
-        """
-        if not isinstance(geometry, Polygon):
-            raise TypeError("Input geometry must be a shapely Polygon")
-        if steps_forward is not None and not isinstance(steps_forward, int):
-            raise TypeError("steps_forward must be None or an integer")
-        if steps_reverse is not None and not isinstance(steps_reverse, int):
-            raise TypeError("steps_reverse must be None or an integer")
-        if remove_threshold is not None:
-            if not isinstance(remove_threshold, float) or not (0 <= remove_threshold <= 1):
-                raise ValueError("remove_threshold must be a float between 0 and 1")
-        if filtersize is not None and not isinstance(filtersize, int):
-            raise TypeError("filtersize must be None or an integer")
-
-        ds = self.dataset
-
-        # Determine end index
-        end_index = (
-            len(ds.mid_date) if steps_forward is None 
-            else min(start_index + steps_forward, len(ds.mid_date))
-        )
-        
-        # Extract coordinates from the input polygon
-        points = np.array(geometry.exterior.coords)
-        
-        # Reverse steps (optional)
-        if steps_reverse:
-            for i in tqdm(range(steps_reverse), desc="Reversing Polygon Position"):
-                points = self.move_points(points, start_index - i, reverse_direction=True)
-            start_index -= steps_reverse
-        
-        # Clip original area
-        gdf = gpd.GeoDataFrame(geometry=[Polygon(points)], crs=f"EPSG:{self.epsg}")
-        crs = gdf.crs
-        first_frame = ds.isel(mid_date=start_index).rio.clip(gdf.geometry, crs, all_touched=True)
-        
-        # Initalize list of frames
-        clipped_frames = [first_frame]
-        
-        # Efficient handling of fracture points (vectorized approach)
-        if remove_threshold is not None:
-            fracture_points = (
-                first_frame.fracture_conf
-                .where(first_frame.fracture_conf > remove_threshold)
-                .stack(points=('x', 'y'))
-                .dropna(dim='points')
-            )
-            fracture_points_coords = (
-                fracture_points.points.data.tolist() 
-                if fracture_points.sizes['points'] > 0 
-                else np.empty((0,2))
-            )
-        
-        # Iterate through time steps
-        for t in tqdm(range(start_index, end_index - 1), desc="Tracking Polygon Over Time"):
-            # Move points
-            points = self.move_points(points, t)
+        if id in self.polygons:
+            raise ValueError(f"Polygon ID {id} already exists")
             
-            # Clip next frame
-            geometry = Polygon(points)
-            next_frame = ds.isel(mid_date=(t + 1)).rio.clip([geometry], crs, all_touched=True)
-            
-            # Efficient fracture points removal (masking)
-            if remove_threshold is not None:
-                # Move fractured coords
-                fracture_points_coords = self.move_points(fracture_points_coords, t)
-            
-                # Create a mask for fracture points
-                fracture_mask = np.zeros_like(next_frame['fracture_conf'], dtype=bool)
-            
-                for x, y in fracture_points_coords:
-                    # Find the closest point in the grid (use nearest if necessary)
-                    x_idx = np.argmin(np.abs(next_frame.x.values - x))
-                    y_idx = np.argmin(np.abs(next_frame.y.values - y))
-            
-                    # Set the corresponding position in the mask to True
-                    fracture_mask[y_idx, x_idx] = True
-            
-                # Apply the mask: set all values to NaN where the mask is True
-                next_frame = next_frame.where(~fracture_mask, np.nan)
-        
-                # Use vectorized approach to collect new fratured ice
-                new_fracture_points = (
-                    next_frame.fracture_conf
-                    .where(next_frame.fracture_conf > remove_threshold)
-                    .stack(points=('x', 'y'))
-                    .dropna(dim='points')
-                )
-                new_fracture_points_coords =(
-                    new_fracture_points.points.data.tolist() 
-                    if new_fracture_points.sizes['points'] > 0 
-                    else np.empty((0,2))
-                )
-        
-                # Stack new fractures on old fractures
-                fracture_points_coords = np.vstack((fracture_points_coords, new_fracture_points_coords))
-        
-            # Append frame to list
-            clipped_frames.append(next_frame)
-        
-        # Concatenate into one dataset
-        lagrange_frame = xr.concat(clipped_frames, dim='mid_date')
-        return apply_med_filt(lagrange_frame, size=filtersize) if filtersize is not None else lagrange_frame
+        polygon = Polygon(id, polygon, self.dataset, **kwargs)
+        self.polygons[id] = polygon
 
-    def track_parcel(self, parcel_id, x, y, track_change_around=False, radius=1200, **kwargs):
+    def track_parcel(self, id, x, y, **kwargs):
         """
-        Computes the time-series values for a parcel moving across a domain over time. 
-        The function integrates strain rate to compute the total strain experienced by the parcel 
-        and appends these values as new variables to the dataset.
-    
-        Parameters
-        ----------
-        x : int or float
-            The x-coordinate of the initial point of interest.
-        y : int or float
-            The y-coordinate of the initial point of interest.
-        buffer : int or float, optional
-            Distance for spatial averaging around the point of interest. Default is 120.
-        start_index : int, optional
-            The time index corresponding to the given (x, y) coordinates. If None, defaults to 0.
-        steps_forward : int, optional
-            The number of timesteps to move forward in time. Defaults to as many timesteps 
-            as available from the start index.
-        steps_reverse : int, optional
-            The number of timesteps to move backward in time. Defaults to 0.
-        filtersize : int, optional
-            The size of the median filter applied to smooth the output dataset. Default is None, meaning no filtering.
-        track_change_around : bool, optional
-            Calls `change_around_parcel` natively to grab regions around a parcel and calculate the change in stress
-            for each month. Must pass radius if True
-        radius : float, optional
-            The radius of the circular region for stress analysis (in dataset coordinate units).
+        Creates and tracks a new parcel.
+        If track_change=True, also initializes a ChangeArea linked to this parcel.
+        """
+        if id in self._parcels:
+            raise ValueError(f"Parcel ID {id} already exists")
+        
+        parcel = Parcel(id, x, y, **kwargs)
+        self._parcels[id] = parcel
 
-        Returns
-        -------
-        parcel : xr.Dataset
-            A dataset with the time dimension containing the original variables and new variables:
-            - `effective_strain`: Cumulative effective strain.
-            - `e_xx`: Cumulative strain in the x-direction.
-            - `e_yy`: Cumulative strain in the y-direction.
-        points : np.ndarray
-            An array of shape (N, 2) where N is the total number of timesteps. Each row contains 
-            the x and y coordinates of the parcel at each timestep.
-    
-        Raises
-        ------
-        TypeError
-            If input types are not as expected.
-        ValueError
-            If `start_index` is out of bounds, if `steps_reverse` or `steps_forward` exceed the dataset limits, 
-            or if any parameters are inconsistent with the dataset dimensions.
-    
-        Notes
-        -----
-        - The function assumes that the dataset's `mid_date` dimension corresponds to the time axis.
-        - The strain rate is integrated cumulatively over time for each timestep.
-        - The `move_points` function is used to determine the parcel's location at each timestep.
-        - If `filtersize` is specified, a median filter is applied using the `apply_med_filt` function.
+    def update_tracking(self, objects):
         """
-        result = self._track_parcel(x, y, **kwargs)
-        self.tracked_parcels[parcel_id] = result
+        Updates the tracking for the objects stored in LagrangianTracker
+        """
+        if type == 'all':
+            for parcel in self._parcels.values():
+                parcel.update_position(self.dataset)
 
-        change_result = self.change_around_parcel(parcel_id, radius)
-        
-        return result, change_result
-    
-    def _track_parcel(
-        self,
-        x: int | float,
-        y: int | float,
-        buffer: int | float = 120,
-        start_index: int = None,
-        steps_forward: int = None,
-        steps_reverse: int = None,
-        filtersize: int = None,
-    ) -> xr.Dataset:
-        """
-        Internal method to track a parcel by moving it over time.
-        """
-        if not ((type(x) == type(y)) & (isinstance(x, (int, float)))):
-            raise ValueError('x- and y-points must be same type, int or float')
-        if start_index is not None and not isinstance(start_index, int):
-            raise TypeError('Starting index must be an int or None')
-        if steps_forward is not None and not isinstance(steps_forward, int):
-            raise TypeError("steps_forward must be None or an integer")
-        if steps_reverse is not None and not isinstance(steps_reverse, int):
-            raise TypeError("steps_reverse must be None or an integer")
-        if not isinstance(buffer, (int, float)):
-            raise TypeError("buffer must be inter or float")
-        if filtersize is not None and not isinstance(filtersize, int):
-            raise TypeError("filtersize must be None or an integer")
+                if parcel._change_area:
+                    parcel._change_area.compute_change(self.dataset)
 
-        ds = self.dataset
-
-        # Initialize variable, ensure indexing works
-        # Grab length of time index
-        length = len(ds.mid_date)
+            for polygon in self._polygons.values():
+                polygon.update_bounds(self.dataset)
         
-        # If start index not given, 
-        if start_index is None:
-            start_index = 0
-            steps_reverse = 0
-        else:
-            # If start index given, check that the index is less than number of timesteps
-            if start_index >= length:
-                raise ValueError("Starting index must be at least 1 less than the mid_date length")
-        
-        # If steps forward not given, go as many steps forward as possible
-        if steps_forward is None:
-            steps_forward = (length - start_index)
-        
-        # If no steps reversed given, set to 0
-        if steps_reverse is None:
-            steps_reverse = 0
-        
-        # Define start and end index
-        first_step = start_index - steps_reverse
-        final_step = start_index + steps_forward
-        
-        if first_step < 0:
-            raise ValueError("Too many steps reverse. Decrease the number of timesteps")
-        
-        if final_step > len(ds.mid_date):
-            raise ValueError("Too many steps forward. Decrease the number of timesteps")
-        
-        # Define points array for move_points func
-        point = np.c_[x, y]
-        
-        points_f = point.copy()
-        
-        # Add initial pt to forward step
-        for i in range(steps_forward-1):
-            point = self.move_points(point, (start_index+i))
-            points_f = np.vstack((points_f, point))
-        
-        point = np.c_[x, y]
-        points_rev = np.empty((0,2))
-        for i in range(0, steps_reverse):
-            point = self.move_points(point, (start_index-i), reverse_direction=True)
-            points_rev = np.vstack((points_rev, point))
-        
-        points = np.vstack((points_rev[::-1], points_f))
-        
-        # Initialize list for selection of dfs for each point
-        point_vals = []    
-        for i, time_index in enumerate(range(first_step, final_step)):
-            x, y = points[i]  # Grab point at time index
-        
-            parcel = ds.sel(x=slice(x-buffer, x+buffer), y=slice(y-buffer, y+buffer)).mean(['x','y'], skipna=True)
-            point_vals.append(parcel.isel(mid_date=time_index))
-        
-        # concat  list of points
-        point_srs = xr.concat(point_vals, dim='mid_date')
-        
-        # Compute total strain using cumulative sum
-        strain = point_srs[['effective', 'eps_xx', 'eps_yy']].cumsum(dim='mid_date')
-        strain = strain.rename_vars({'effective':'effective_strain','eps_xx':'e_xx', 'eps_yy':'e_yy'})
-        
-        # Add strain vars to dataset
-        parcel = xr.merge([point_srs, strain])
-        
-        # Apply median filter
-        if filtersize:
-            parcel = apply_med_filt(parcel, filtersize)
-        
-        # Add x- and y-coordinates to dataset at function of mid_date
-        parcel[['x', 'y']] = [(('mid_date'), points.T[0]), (('mid_date'), points.T[1])]
-    
-        return parcel
-
-    def change_around_parcel(self, parcel_id, r, **kwargs):
-        """
-        Compute stress changes over time within a circular region.
-    
-        This function iterates through all time steps in `parcel_ds`, extracting a 
-        circular region of radius `radius` centered on `(x, y)` at each time step. 
-        It computes the differences in stress metrics (`sigma1`, `sigma2`, `von_mises stress`) 
-        between consecutive time steps and returns them in a new `xarray.Dataset`.
-    
-        Parameters
-        ----------
-        parcel_id : xarray.Dataset
-            Dataset containing parcel location coordinates (`x`, `y`) indexed by `mid_date`.
-        radius : float
-            The radius of the circular region for stress analysis (in dataset coordinate units).
-    
-        Returns
-        -------
-        xarray.Dataset
-            A dataset containing:
-            
-            - `delta_P1` : (mid_date, y, x) Change in Principal Stress 1 (`sigma1`) over time.
-            - `delta_P2` : (mid_date, y, x) Change in Principal Stress 2 (`sigma2`) over time.
-            - `delta_VM` : (mid_date, y, x) Change in von Mises stress over time.
-            - `fracture_conf` : (mid_date, y, x) Fracture confidence values at each time step.
-    
-            The dataset is indexed by `mid_date`, `y`, and `x`, with coordinates for 
-            `x` and `y` varying per time step.
-    
-        Notes
-        -----
-        - The function requires `extract_circular_region` to define the extraction method.
-        - The first time step does not have a corresponding `delta_*` value since differences 
-          are computed between consecutive frames.
-        """
-        result = self._change_around_parcel(parcel_id, r, **kwargs)
-        self.tracked_change_areas[parcel_id] = result
-        return result
-    
-    def _change_around_parcel(
-        self, 
-        parcel_id: str,
-        radius: int | float,
-    ) -> xr.Dataset:
-        """
-        Internal method to track change around a parcel by clipping areas around
-        different (x, y) points through time.
-        """
-        try:
-            parcel_ds = self.tracked_parcels[parcel_id]
-        except:
-            raise ValueError(f'Parcel {parcel_id} has not been tracked. Please call track_parcel() with this ID first.')
-
-        p_i = None  # initialize previous step as empty
-        
-        # Prepare dictionaries for data storage
-        var_names = ['delta_P1', 'delta_P2', 'delta_VM', 'fracture_conf']
-        parcel_dict = {var:(('mid_date','y','x'),[]) for var in var_names}
-        
-        coords = {'mid_date':[], 'x':(('mid_date', 'x'),[]), 'y':(('mid_date', 'y'),[])}
-        for t in parcel_ds.mid_date:
-            # grab (x, y) center
-            x = parcel_ds.x.sel(mid_date=t).item()
-            y = parcel_ds.y.sel(mid_date=t).item()
-
-            # Grab circular region at t
-            p_n, x_coords, y_coords = self._extract_circular_region(x, y, t, radius)
-    
-            # If previous (x, y) exists:
-            if p_i:
-                # Calculcate change in stressed, store in dict
-                parcel_dict['delta_P1'][1].append(p_n.sigma1.to_numpy() - p_i.sigma1.to_numpy())
-                parcel_dict['delta_P2'][1].append(p_n.sigma2.to_numpy() - p_i.sigma2.to_numpy())
-                parcel_dict['delta_VM'][1].append(p_n.von_mises.to_numpy() - p_i.von_mises.to_numpy())
-                parcel_dict['fracture_conf'][1].append(p_n.fracture_conf.to_numpy())
-    
-                # Store coordinate data
-                coords['mid_date'].append(t.data)
-                coords['x'][1].append(x_coords)
-                coords['y'][1].append(y_coords)
-            
-            # Save copy of current frame as previous frame
-            p_i = p_n.copy()
-    
-        return xr.Dataset(data_vars=parcel_dict, coords=coords)
-
-    def _extract_circular_region(self, x, y, t, r):
-        """
-        Internal method for collecting the circular region around an (x, y) point at a specific timestep
-        """
-        ds = self.dataset
+        elif type == 'parcels':
+            for parcel in self._parcels.values():
+                parcel.update_bounds(self.dataset)
                 
-        # Grab square region around (x, y)
-        ds = ds.sel(mid_date=t, x=slice(x - r, x + r), y=slice(y - r, y + r))
-        
-        # Compute distances from center
-        distances = np.sqrt((ds.x.values[:, np.newaxis] - x)**2 + (ds.y.values[np.newaxis, :] - y)**2)
-    
-        # Save distance from (x, y) as variable in dataset
-        ds['radii'] = (('y', 'x'), distances)
-        ds = ds.where(ds.radii <= r)
-        
-        return ds, ds.x.values, ds.y.values
+                if parcel._change_area:
+                    parcel.change_area.compute_change(self.dataset)
+                    
+        elif type == 'polygons':
+            for polygon in self._polygons.values():
+                polygon.update_position(self.dataset)
 
+    def get_polygon(self, id):
+        return self._polygons[id]
+
+    def get_parcel(self, id):
+        return self._parcels[id]
+
+            
 ##################################################################################
 
 class TrackedObject:
     """Base class for tracked objects."""
     def __init__(self, id: str):
         self.id = id
-        self.history = []
+        self._history = []
+        self.__tracked = False
 
     def add_state(self, state):
         """Record a state in the tracking history."""
-        self.history.append(state)
+        self._history.append(state)
+
+    def mark_tracked(self):
+        self.__tracked = True
+
+    def check_tracked(self):
+        return self.__tracked
 
 class Polygon(TrackedObject):
-    def __init__(self, polygon, start_index, steps_forward, steps_reverse):
-        self.polygon = polgon
+    """Class for Polygon tracking through time."""
+    def __init__(self, id, polygon):
+        super().__init__(id)
+        self._polygon = polygon
+
+    def update_bounds(self, ds):
+        if self.__tracked:
+            print("Polygon fully tracked")
+            return
+        pass
 
 class Parcel(TrackedObject):
-    def __init__(self, x, y, start_index, steps_forward, steps_reverse):
+    """Class for Parcel Tracking through time."""
+    def __init__(
+        self,
+        id: str,
+        x: float | int, 
+        y: float,
+        track_change: bool = False,
+        radius: float | int = None,
+        start_index: int = 0,
+        steps_forward: int = None,
+        steps_reverse: int = None
+    ):
+        super().__init__(id)
         self.x = x
         self.y = y
-        self.start_index = start_index
-        self.steps_forward = steps_forward
-        self.steps_reverse = steps_reverse
+        self._change_area = None
+
+        if track_change and radius:
+            self.change_area = ChangeArea(id + '_area', x, y, radius)
+
+    def update_position(self, ds):
+        vx = ds.vx
+        vy = ds.vy
+        
 
 class ChangeArea(Parcel):
-    def __init__(self, radius):
-        self.radius = radius
-        self.stress_changes = []
-        self.x_coords = []
+    def __init__(self, id, x, y, radius):
+        super().__init__(id, x, y)
+        self._radius = radius
+        self._stress_changes = None
+
+    def calculate_change(self, ds):
+        pass
+        
 
 ##################################################################################
 
