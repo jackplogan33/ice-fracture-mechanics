@@ -295,94 +295,220 @@ class LagrangianTracking:
         Dictionary to store tracked stress change areas.
     """
     def __init__(self, dataset, epsg=3031):
-        self.dataset = dataset
+        self._dataset = dataset
         self.epsg = epsg
         self._polygons = {}      # Store objects for multiple polygons
         self._parcels = {}       # Store objects for multiple parcels
+        self._max_index = len(dataset.mid_date)
 
     def track_polygon(self, id, polygon, **kwargs):
         """
         Creates and tracks a new polygon
+
+        -- Docstring needs LOVE so that it can be initialized properly
         """
-        if id in self.polygons:
+        if id in self._polygons:
             raise ValueError(f"Polygon ID {id} already exists")
             
-        polygon = Polygon(id, polygon, self.dataset, **kwargs)
-        self.polygons[id] = polygon
+        polygon = Polygon(id, polygon, self._max_index, **kwargs)
+        self._polygons[id] = polygon
 
     def track_parcel(self, id, x, y, **kwargs):
         """
         Creates and tracks a new parcel.
         If track_change=True, also initializes a ChangeArea linked to this parcel.
+        
+        -- Docstring needs LOVE so that it can be initialized properly
         """
         if id in self._parcels:
             raise ValueError(f"Parcel ID {id} already exists")
         
-        parcel = Parcel(id, x, y, **kwargs)
+        parcel = Parcel(id, x, y, self._max_index, **kwargs)
         self._parcels[id] = parcel
 
-    def update_tracking(self, objects):
+    def update_tracking(self, object_type='all'):
         """
         Updates the tracking for the objects stored in LagrangianTracker
         """
-        if type == 'all':
-            for parcel in self._parcels.values():
-                parcel.update_position(self.dataset)
+        objects = []
 
-                if parcel._change_area:
-                    parcel._change_area.compute_change(self.dataset)
-
-            for polygon in self._polygons.values():
-                polygon.update_bounds(self.dataset)
+        # Get the polygons or parcels depending on desired type
+        if object_type == 'all':
+            objects = list(self._parcels.values()) + list(self._polygons.values())
         
         elif type == 'parcels':
-            for parcel in self._parcels.values():
-                parcel.update_bounds(self.dataset)
-                
-                if parcel._change_area:
-                    parcel.change_area.compute_change(self.dataset)
-                    
+            objects = list(self._parcels.values())
+
         elif type == 'polygons':
-            for polygon in self._polygons.values():
-                polygon.update_position(self.dataset)
+            objects = list(self._polygons.values())
 
-    def get_polygon(self, id):
-        return self._polygons[id]
+        # Update position for all tracked objects desired
+        for object in objects:
+            object.update(self._dataset)
 
-    def get_parcel(self, id):
-        return self._parcels[id]
+    def get_polygon(self, ids):
+        if ids == 'all':
+            return self._polygons
+
+        else:
+            return self._polygons[ids]
+
+    def get_parcel(self, ids):
+        if ids == 'all':
+            return self._parcels
+        
+        else:
+            return self._parcels[ids]
 
             
 ##################################################################################
+"""
+Current thoughts about getting and updating data:
+- iterate through timesteps moving points/polygons
+- append dataset clips to the "history" attribute
+- write func to "get_data" that merges and sorts these xarray datasets.
+  - Alternatively: after setting `__tracked = True`, merge and combine datasets,
+    save as _dataset attribute in parcel/polygon option
+  - Then call get_data which returns these datasets
+"""
+
 
 class TrackedObject:
     """Base class for tracked objects."""
-    def __init__(self, id: str):
+    def __init__(
+        self, 
+        id: str,
+        max_index: int,
+        start_index: int = 0,
+        steps_forward: int = None,
+        steps_reverse: int = None,
+        timeseries_length: int = None
+    ):
         self.id = id
-        self._history = []
-        self.__tracked = False
+        self._backward_history = []  # Save history for reverse tracking
+        self._forward_history = []   # Save hsitory for forward tracking
+        self.__tracked = False  # Fully Tracked ds flag
+        self._dataset = None    # Merged dataset 
 
-    def add_state(self, state):
-        """Record a state in the tracking history."""
-        self._history.append(state)
+        # Store tracking parameters
+        self._start_index = start_index
+        self._max_index = max_index
+        self._steps_forward = steps_forward
+        self._steps_reverse = steps_reverse
+
+        self._validate_params()
+
+    def _validate_params(self):
+        """
+        Assertions and such that will validate the params, raise appropriate type errors
+        """
+        # Start index validation
+        if not isinstance(self._start_index, int) and (self._start_index <= self._max_index) and (self._start_index >= 0):
+            raise ValueError(f"`start_index` must be an integer between 0 and {self._max_index}")
+
+        # Reverse Stepping validation
+        if not self._steps_reverse:
+            self._steps_reverse = 0
+        else:
+            if not isinstance(self._steps_reverse, int):
+                raise TypeError("`steps_reverse` must be an integer")
+
+        # Forward stepping validaiton
+        if not self._steps_forward:
+            self._steps_forward = (self._max_index - self._start_index)
+
+        else:
+            if not isinstance(self.steps_forward, int):
+                raise TypeError("`steps_forward` must be an integer value")
+
+            if (self._steps_forward + self._start_index) > self._max_index:
+                raise ValueError("`steps_forward` is too large, please pick a lower number")
+    
+    def update(self, dataset):
+        """
+        Calls class specific forward and backward tracking
+        Merges and sorts the two directional datasets
+        Marks object as tracked
+        """
+        if not self.is_tracked():
+            print(f'Tracking {self.id}')
+            self._forward(dataset)
+
+            self._backward(dataset)
+
+            self._merge_and_sort()
+
+            self.mark_tracked()
+
+    def _forward(self, dataset):        
+        for i in range(self._steps_forward-1):
+            self._move_points(dataset, i, direction=1)
+
+    def _backward(self, dataset):
+        for i in range(self._steps_reverse):
+            self._move_points(dataset, self._start_index-i, direction=-1)
+    
+    def _move_points(self, dataset, index, direction):
+        raise NotImplementedError('Subclasses must implment `_move_points`')
 
     def mark_tracked(self):
+        """Flag that sets object status to fully tracked"""
         self.__tracked = True
 
-    def check_tracked(self):
+    def is_tracked(self):
+        """Check if item is fully tracked"""
         return self.__tracked
 
 class Polygon(TrackedObject):
     """Class for Polygon tracking through time."""
-    def __init__(self, id, polygon):
-        super().__init__(id)
+    def __init__(
+        self, 
+        id, 
+        polygon,
+        max_index,
+        start_index,
+        steps_forward,
+        steps_reverse,
+        remove_threshold = None
+    ):
+        super().__init__(id, max_index, start_index, steps_forward, steps_reverse)
         self._polygon = polygon
+        self._remove_threshold = remove_threshold
+        self._fractured_pts = None
+        
+        self._forward_history.append(polygon)  # Add initial polygon
+    
+    def _move_points(self, ds, index, direction):
+        # Fetch closest version of polygon 
+        if index == self._start_index:
+            polygon = self._polygon
+        
+        elif direction == 1:
+            polygon = self._forward_history[-1]
 
-    def update_bounds(self, ds):
-        if self.__tracked:
-            print("Polygon fully tracked")
-            return
-        pass
+        else:
+            polygon = self._backward_history[-1]
+
+        points = np.array(polygon.exterior.coords)
+        
+        for i in range(points.shape[0]):
+            # Fetch velocities
+            vx = ds.vx[index].sel(x=points[i, 0], y=points[i, 1], method='nearest').data
+            vy = ds.vy[index].sel(x=points[i, 0], y=points[i, 1], method='nearest').data
+
+            # Set NaN velocities to 0
+            if np.isnan(vx): vx = 0
+            if np.isnan(vy): vy = 0
+
+            # Change in x- and y-directions
+            points[i, 0] += direction * (vx / 12)
+            points[i, 1] += direction * (vy / 12)
+
+            if direction == 1:
+                self._forward_history.append(Polygon(points))
+
+            else:
+                self._backward_history.append(Polygon(points))
 
 class Parcel(TrackedObject):
     """Class for Parcel Tracking through time."""
@@ -390,35 +516,76 @@ class Parcel(TrackedObject):
         self,
         id: str,
         x: float | int, 
-        y: float,
+        y: float | int,
+        max_index: int,
         track_change: bool = False,
         radius: float | int = None,
         start_index: int = 0,
         steps_forward: int = None,
         steps_reverse: int = None
     ):
-        super().__init__(id)
+        super().__init__(id, max_index, start_index, steps_forward, steps_reverse)
         self.x = x
         self.y = y
         self._change_area = None
 
-        if track_change and radius:
-            self.change_area = ChangeArea(id + '_area', x, y, radius)
+        self._forward_history.append((x, y))
 
-    def update_position(self, ds):
-        vx = ds.vx
-        vy = ds.vy
+        if track_change and radius:
+            self._change_area = ChangeArea(id + '_area', x, y, max_index, radius)
+    
+    def _move_points(self, ds, index, direction):
+        if index == self._start_index:
+            x, y = self.x, self.y
         
+        elif direction == 1:
+            x, y = self._forward_history[-1]
+
+        else:
+            x, y = self._backward_history[-1]
+
+        vx = ds.vx[index].sel(x=x, y=y, method='nearest').data
+        vy = ds.vy[index].sel(x=x, y=y, method='nearest').data
+
+        if np.isnan(vx): vx = 0
+        if np.isnan(vy): vy = 0
+
+        x += direction * (vx / 12)
+        y += direction * (vy / 12)
+
+        if direction == 1:
+            self._forward_history.append((x, y))
+        else:
+            self._forward_history.append((x, y))
 
 class ChangeArea(Parcel):
-    def __init__(self, id, x, y, radius):
-        super().__init__(id, x, y)
+    def __init__(self, id, x, y, max_index, radius):
+        super().__init__(id, x, y, max_index)
         self._radius = radius
         self._stress_changes = None
 
-    def calculate_change(self, ds):
-        pass
-        
+    def grab_area(
+        self, 
+        ds,
+        time_index: int  # Need to decide if using .sel or .isel
+    ):
+        """Extract stress change in a circular area around the parcel."""
+        x, y, r = self.x, self.y, self._radius
+        ds = ds.sel(x=slice(x-r, x+r), y=slice(y-r, y+r))
+
+        xx, yy = np.meshgrid(ds.x.values, ds.y.values)
+        distances = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+
+        ds['dist'] = (('mid_date', 'y', 'x'), distances)
+        area_ds = ds.where(ds['dist'] < r)
+
+        self._history.append(area_ds)
+    
+    def compute_change(self):
+        if self.__tracked():
+            ds = xr.merge(self._history)
+            ds = ds.sortby('mid_date')
+        return
 
 ##################################################################################
 
