@@ -363,15 +363,15 @@ class LagrangianTracking:
             
 ##################################################################################
 """
-Current thoughts about getting and updating data:
-- iterate through timesteps moving points/polygons
-- append dataset clips to the "history" attribute
-- write func to "get_data" that merges and sorts these xarray datasets.
-  - Alternatively: after setting `__tracked = True`, merge and combine datasets,
-    save as _dataset attribute in parcel/polygon option
-  - Then call get_data which returns these datasets
-"""
+TODO: (high to low priority)
+- Incorporate change areas into Parcel.update()
+- Write merge function
+- Add `get_data` method for retreiving final data
 
+- Start visualization class
+- Work on docstrings for ease of use
+- Rework GlacierDataProcessor to be more modular + clean
+"""
 
 class TrackedObject:
     """Base class for tracked objects."""
