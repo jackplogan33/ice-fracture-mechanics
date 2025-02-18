@@ -300,8 +300,8 @@ class LagrangianTracking:
     def __init__(self, dataset, epsg=3031):
         self._dataset = dataset
         self.epsg = epsg
-        self._polygons = {}      # Store objects for multiple polygons
-        self._parcels = {}       # Store objects for multiple parcels
+        self._polygons = []      # Store objects for multiple polygons
+        self._parcels = []       # Store objects for multiple parcels
         self._max_index = len(dataset.mid_date)
 
     def track_polygon(self, id, polygon, **kwargs):
@@ -310,11 +310,12 @@ class LagrangianTracking:
 
         -- Docstring needs LOVE so that it can be initialized properly
         """
-        if id in self._polygons:
+        ids = [poly.id for poly in self._polygons]
+        if id in ids:
             raise ValueError(f"Polygon ID {id} already exists")
             
         polygon = Polygon(id, polygon, self.epsg, self._max_index, **kwargs)
-        self._polygons[id] = polygon
+        self._polygons.append(polygon)
 
     def track_parcel(self, id, x, y, **kwargs):
         """
@@ -323,11 +324,12 @@ class LagrangianTracking:
         
         -- Docstring needs LOVE so that it can be initialized properly
         """
-        if id in self._parcels:
+        ids = [parc.id for parc in self._parcels]
+        if id in ids:
             raise ValueError(f"Parcel ID {id} already exists")
         
         parcel = Parcel(id, x, y, self._max_index, **kwargs)
-        self._parcels[id] = parcel
+        self._parcels.append(parcel)
 
     def update_tracking(self, object_type='all'):
         """
@@ -335,45 +337,74 @@ class LagrangianTracking:
         """
         objects = []
 
-        # Get the polygons or parcels depending on desired type
+        # Get all tracked objects
         if object_type == 'all':
-            objects = list(self._parcels.values()) + list(self._polygons.values())
-        
-        elif type == 'parcels':
-            objects = list(self._parcels.values())
+            objects = self._parcels + self._polygons
 
+        # Get only parcels
+        elif type == 'parcels':
+            objects = self._parcels
+
+        # get only polygons
         elif type == 'polygons':
-            objects = list(self._polygons.values())
+            objects = self._polygons
 
         # Update position for all tracked objects desired
         for object in objects:
             object.update(self._dataset)
     
-    def get_polygon(self, ids):
-        if ids == 'all':
-            return self._polygons
+    def get_polygon_data(self):
+        polygon_data = {}
+        for polygon in self._polygons:
+            polygon_data[polygon.id] = polygon.get_data()
 
-        else:
-            return self._polygons[ids]
+        return polygon_data
 
-    def get_parcel(self, ids):
-        if ids == 'all':
-            return self._parcels
+    def get_parcel_data(self):
+        parcel_data = {}
+        for parcel in self._parcels:
+            if not parcel._radius:
+                parcel_data[parcel.id] = parcel.get_data()
+
+            else:
+                parcel_ds, change_area_ds = parcel.get_data()
+                parcel_data[parcel.id] = {'parcel':parcel_ds, 'change_area':change_area_ds}
+
+        return parcel_data
+
+    def plot_tracked_objects(self, index=27, figsize=(10,8)):
+        fig, ax = plt.subplots(figsize=figsize)
+                
+        self._dataset.fracture_conf[i].plot(ax=ax, cbar_kwargs={'label':'Fracture Confidence [0:1]'})
         
-        else:
-            return self._parcels[ids]
+        for i, parcel in enumerate(self._parcels):
+            parcel_ds = parcel.get_data('point')
+        
+            ax.plot(parcel_ds.x[index], parcel_ds.y[index], markersize=2, c=f'C{i}', marker='o', ls='', label=parcel.id)
+        
+        for polygon in self._polygons:
+            gdf = gpd.GeoDataFrame(geometry=[polygon._history[index]], crs=tracker.epsg)
+            gdf.plot(ax=ax, facecolor='none', edgecolor='k', lw=1, label=polygon.id)
+        
+        ax.set_title('Tracked Objects on ')
+        ax.set_xlabel('x [meters]')
+        ax.set_ylabel('y [meters]')
+        ax.set_aspect('equal')
+        ax.legend()
+        
+        plt.show()
 
-            
 ##################################################################################
 """
 TODO: (high to low priority)
-- Incorporate change areas into Parcel.update()
-- Add `get_data` method for retreiving final data
-
 - Start visualization class
+    - not a class, just new methods in LagrangianTracking
+
+- Comment code (started)
 - Work on docstrings for ease of use
-- Comment code
-- Rework GlacierDataProcessor to be more modular + clean
+
+
+- Rework GlacierDataProcessor to be more modular + clean (this is a later problem)
 """
 
 class TrackedObject:
@@ -388,6 +419,7 @@ class TrackedObject:
         timeseries_length: int = None
     ):
         self.id = id
+        self._history = None         # Placeholder for in-order history
         self._backward_history = []  # Save history for reverse tracking
         self._forward_history = []   # Save hsitory for forward tracking
         self._dataset = []    # Merged dataset 
@@ -418,7 +450,7 @@ class TrackedObject:
 
         # Forward stepping validaiton
         if not self._steps_forward:
-            self._steps_forward = (self._max_index - self._start_index)
+            self._steps_forward = (self._max_index - self._start_index) - 1
 
         else:
             if not isinstance(self.steps_forward, int):
@@ -433,31 +465,33 @@ class TrackedObject:
         Merges and sorts the two directional datasets
         Marks object as tracked
         """
+        # Only update if not tracked
         if not self.is_tracked():
-            # 
-            self._forward(dataset)
-
-            self._backward(dataset)
-
-            self._merge_and_sort()
-
-            self.mark_tracked()
-
-    def _forward(self, dataset):
-        raise NotImplementedError('Subclasses must implement `_forward`')
-        
-    def _backward(self, dataset):
-        raise NotImplementedError('Subclasses must implement `_backward`')
+            self._forward(dataset)    # Track object forward
+            self._backward(dataset)   # Track object in reverse
+            self._merge_and_sort()    # Merge and timesort
+            self._merge_history()
+            self.mark_tracked()       # Mark object as tracked
     
-    def _move_points(self, dataset, index, direction):
-        raise NotImplementedError('Subclasses must implment `_move_points`')
+    def _move_points(self, ds, x, y, index, direction):
+        """Internal method for moving xy-points in a velocity field"""
+        # Point x- and y-velocites
+        vx = ds.vx[index].sel(x=x, y=y, method='nearest').item()
+        vy = ds.vy[index].sel(x=x, y=y, method='nearest').item()
 
-    def _merge_and_sort(self):
-        raise NotImplementedError('Subclasses must implement `move_points`')
-        self._dataset = xr.concat(self._dataset, dim='mid_date')
+        # Set NaN to 0
+        if np.isnan(vx): vx = 0
+        if np.isnan(vy): vy = 0
 
-    def get_dataset(self):
-        return self._dataset
+        # Compute distnace travellen in 1 month
+        # multiply by direction factor
+        x += direction * (vx / 12)
+        y += direction * (vy / 12)
+
+        return [x, y]
+
+    def _merge_history(self):
+        self._history = self._backward_history[::-1] + self._forward_history
     
     def mark_tracked(self):
         """Flag that sets object status to fully tracked"""
@@ -466,6 +500,18 @@ class TrackedObject:
     def is_tracked(self):
         """Check if item is fully tracked"""
         return self.__tracked
+
+    def _forward(self, dataset):
+        raise NotImplementedError('Subclasses must implement `_forward`')
+        
+    def _backward(self, dataset):
+        raise NotImplementedError('Subclasses must implement `_backward`')
+
+    def _merge_and_sort(self):
+        raise NotImplementedError('Subclasses must implement `move_points`')
+
+    def get_data(self):
+        raise NotImplementedError('Subclasses must implement `get_data')
 
 class Polygon(TrackedObject):
     """Class for Polygon tracking through time."""
@@ -489,55 +535,39 @@ class Polygon(TrackedObject):
     def _forward(self, ds):
         frame = ds.isel(mid_date=self._start_index).rio.clip([self._polygon], f"EPSG:{self._epsg}", all_touched=True)
         self._dataset.append(frame)
-        
-        for i in range(self._steps_forward-1):
+
+        polygon = self._polygon
+        for i in range(self._steps_forward):
             index = self._start_index + i
-            polygon = self._move_points(ds, index, direction=1)
+            points = np.array(polygon.exterior.coords)
+            for i in range(points.shape[0]):
+                points[i, :] = self._move_points(ds, points[i,0], points[i,1], index, direction=1)
+            polygon = sPolygon(points)
             frame = ds.isel(mid_date=index+1).rio.clip([polygon], f"EPSG:{self._epsg}", all_touched=True)
 
             self._forward_history.append(polygon)
             self._dataset.append(frame)
 
     def _backward(self, ds):
+        polygon = self._polygon
         for i in range(self._steps_reverse):
-            index = self._start_index-i
-            polygon = self._move_points(ds, index, direction=-1)
+            index = self._start_index - i
+            points = np.array(polygon.exterior.coords)
+            
+            for i in range(points.shape[0]):
+                points[i,:] = self._move_points(ds, points[i,0], points[i,1], index, direction=-1)
+            polygon = sPolygon(points)
             frame = ds.isel(mid_date=index-1).rio.clip([polygon], f"EPSG:{self._epsg}", all_touched=True)
             
             self._backward_history.append(polygon)
             self._dataset.append(frame)
 
-    def _move_points(self, ds, index, direction):
-        # Fetch closest version of polygon 
-        if index == self._start_index:
-            polygon = self._polygon
-        
-        elif direction == 1:
-            polygon = self._forward_history[-1]
-
-        else:
-            polygon = self._backward_history[-1]
-
-        points = np.array(polygon.exterior.coords)
-        
-        for i in range(points.shape[0]):
-            # Fetch velocities
-            vx = ds.vx[index].sel(x=points[i, 0], y=points[i, 1], method='nearest').data
-            vy = ds.vy[index].sel(x=points[i, 0], y=points[i, 1], method='nearest').data
-
-            # Set NaN velocities to 0
-            if np.isnan(vx): vx = 0
-            if np.isnan(vy): vy = 0
-
-            # Change in x- and y-directions
-            points[i, 0] += direction * (vx / 12)
-            points[i, 1] += direction * (vy / 12)
-
-        return sPolygon(points)
-
     def _merge_and_sort(self):
         self._dataset = xr.concat(self._dataset, dim='mid_date')
         self._dataset = self._dataset.sortby('mid_date')
+
+    def get_data(self):
+        return self._dataset
 
 class Parcel(TrackedObject):
     """Class for Parcel Tracking through time."""
@@ -556,122 +586,122 @@ class Parcel(TrackedObject):
         self.x = x
         self.y = y
         self._radius = radius
+        self._break_time = None
 
         if radius:
             self._change_areas = []
             self._change_dataset = None
     
     def _forward(self, ds):
-        point = ds.isel(mid_date=self._start_index).sel(x=self.x, y=self.y, method='nearest')
-        self._dataset.append(point)
-        if self._radius:
-            self._grab_areas(ds, self._start_index)
-        
-        for i in range(self._steps_forward-1):
-            index = self._start_index + i
-            x, y = self._move_points(ds, index, direction=1)
-            point = ds.isel(mid_date=index+1).sel(x=x, y=y, method='nearest')
+        # Save initial (x, y) as variables
+        x, y = self.x, self.y
 
-            self._dataset.append(point)
+        # Select inital frame, save to attribute
+        pt_data = ds.isel(mid_date=self._start_index).sel(x=x, y=y, method='nearest')
+        self._dataset.append(pt_data)
+
+        # Selected radius around if passed
+        if self._radius: self._grab_areas(ds, self._start_index, x, y)
+
+        # Iterate through number of steps forward
+        for i in range(self._steps_forward):
+            t = self._start_index + i  # current time index
+
+            # Move (x, y), select point data at *next* time index
+            x, y = self._move_points(ds, x, y, t, direction=1)
+            pt_data = ds.isel(mid_date=t+1).sel(x=x, y=y, method='nearest')
+
+            # Select area around if radius passed
+            if self._radius: self._grab_areas(ds, t+1, x, y)
+                
+            # Add states to dataset and forward history
+            self._dataset.append(pt_data)
             self._forward_history.append((x, y))
 
-            if self._radius:
-                self._grab_areas(ds, index+1)
-
     def _backward(self, ds):
-        for i in range(self._steps_reverse):
-            index = self._start_index - i
-            x, y = self._move_points(ds, index, direction=-1)
-            point = ds.isel(mid_date=index-1).sel(x=x, y=y, method='nearest')
+        # Save initial (x, y) as variables
+        x, y = self.x, self.y
 
-            self._dataset.append(point)
+        # Iterate through number of steps backward
+        for i in range(self._steps_reverse):
+            t = self._start_index - i  # Current time index
+
+            # Move (x, y), select point data at *previous* time index
+            x, y = self._move_points(ds, x, y, t, direction=-1)
+            pt_data = ds.isel(mid_date=t-1).sel(x=x, y=y, method='nearest')
+
+            # Select area around redius if passed
+            if self._radius: self._grab_areas(ds, t-1, x, y)
+
+            # Add states to dataset and forward history
+            self._dataset.append(pt_data)
             self._backward_history.append((x, y))
 
-            if self._radius:
-                self._grab_areas(ds, index-1)
-
-    def _move_points(self, ds, index, direction):
-        if index == self._start_index:
-            x, y = self.x, self.y
-        
-        elif direction == 1:
-            x, y = self._forward_history[-1]
-
-        else:
-            x, y = self._backward_history[-1]
-
-        vx = ds.vx[index].sel(x=x, y=y, method='nearest').data
-        vy = ds.vy[index].sel(x=x, y=y, method='nearest').data
-
-        if np.isnan(vx): vx = 0
-        if np.isnan(vy): vy = 0
-
-        x += direction * (vx / 12)
-        y += direction * (vy / 12)
-
-        return x, y
-
-    def _grab_areas(
-        self, 
-        ds,
-        t
-    ):
-        """Extract stress change in a circular area around the parcel."""
-        if self._start_index == t:
-            x, y = self.x, self.y
-        elif t > self._start_index:
-            x, y = self._forward_history[-1]
-        else:
-            x, y = self._backward_history[-1]
-        
+    def _grab_areas(self, ds, t, x, y):
+        """Extract a circular area around the parcel."""
         r = self._radius
+
+        # Grab bounding box
         ds = ds.isel(mid_date=t).sel(x=slice(x-r, x+r), y=slice(y-r, y+r))
 
+        # Calculate the distances from (x, y)
         xx, yy = np.meshgrid(ds.x.values, ds.y.values)
         distances = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
 
-        ds['dist'] = (('y', 'x'), distances)
-        area_ds = ds.where(ds['dist'] < r)
+        ds['dist'] = (('y', 'x'), distances)  # New variable in ds
+        area_ds = ds.where(ds['dist'] < r)    # Get only distances < r
 
-        self._change_areas.append(area_ds)
+        self._change_areas.append(area_ds)    # add state to change areas
 
     def _merge_and_sort(self):
-        self._dataset = xr.concat(self._dataset, dim='mid_date')
+        self._dataset = xr.concat(self._dataset, dim='mid_date')  # Concatenate point dataset
+        self._dataset = self._dataset.sortby('mid_date')          # Sort by time
 
-        if self._radius:
-            self._compute_change():
+        # Compute change between timesteps if radius tracked
+        if self._radius: self._compute_change()
 
     def _compute_change(self):
-        raise NotImplementedError('Stress Change Areas not implemented yet')
+        # Concatenate change areas, sort by time
+        area_ds = xr.concat(self._change_areas, dim='mid_date').sortby('mid_date')
 
-class ChangeArea(Parcel):
-    def __init__(self, id, x, y, max_index, radius):
-        super().__init__(id, x, y, max_index)
-        self._radius = radius
-        self._stress_changes = []
+        # For Xarray: set up coords and data variables
+        coords = {'mid_date':[],'y':(('mid_date','y'),[]), 'x':(('mid_date','x'),[])}
+        dims = ('mid_date', 'y', 'x')
+        change_data = {'d_'+var:(dims, []) for var in area_ds.data_vars}
+        
+        for i in range(1, len(area_ds.mid_date)):  # iterate timeseries
+            for var, values in area_ds.items():    # iterate variables
+                # send arrays to numpy, compute difference
+                var_change = values[i].to_numpy() - values[i-1].to_numpy()
 
-    def grab_areas(
-        self, 
-        ds,
-        t
-    ):
-        """Extract stress change in a circular area around the parcel."""
-        x, y, r = self.x, self.y, self._radius
-        ds = ds.isel(mid_date=t).sel(x=slice(x-r, x+r), y=slice(y-r, y+r))
+                # add difference to list for respective variable
+                change_data['d_'+var][1].append(var_change)
 
-        xx, yy = np.meshgrid(ds.x.values, ds.y.values)
-        distances = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+            # Update coords
+            coords['mid_date'].append(values.mid_date[i].data)
+            coords['y'][1].append(values.y)
+            coords['x'][1].append(values.x)
+                
+        # Create xarray dataset for difference, save as attribute
+        self._change_dataset = xr.Dataset(data_vars=change_data, coords=coords).sortby('mid_date')
 
-        ds['dist'] = (('y', 'x'), distances)
-        area_ds = ds.where(ds['dist'] < r)
+    def find_break_time(self, thresh=0.65):
+        if self.__tracked:
+            point_data = self._dataset
+            for i in range(len(point_data.mid_date)):
+                if point_data.fracture_conf[i] > thresh:
+                    self._break_time = point_data.mid_date[i]
+                    break
 
-        self._stress_changes.append(area_ds)
-    
-    def compute_change(self):
-        if self.__tracked():
-            ds = xr.merge(self._history)
-            ds = ds.sortby('mid_date')
-        return
+    def get_data(self, type):
+        if type == 'all':
+            return self._dataset, self._change_dataset
+
+        elif type == 'point':
+            return self._dataset
+
+        elif type == 'area':
+            return self._change_dataset
 
 ##################################################################################
 
