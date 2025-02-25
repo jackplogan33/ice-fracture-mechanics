@@ -310,25 +310,23 @@ class LagrangianTracking:
 
         -- Docstring needs LOVE so that it can be initialized properly
         """
-        ids = [poly.id for poly in self._polygons]
-        if id in ids:
+        if any(poly.id == id for poly in self._polygons):
             raise ValueError(f"Polygon ID {id} already exists")
             
         polygon = Polygon(id, polygon, self.epsg, self._max_index, **kwargs)
         self._polygons.append(polygon)
 
-    def track_parcel(self, id, x, y, **kwargs):
+    def track_parcel(self, id, x, y, buffer, **kwargs):
         """
         Creates and tracks a new parcel.
         If track_change=True, also initializes a ChangeArea linked to this parcel.
         
         -- Docstring needs LOVE so that it can be initialized properly
         """
-        ids = [parc.id for parc in self._parcels]
-        if id in ids:
+        if any(parc.id == id for parc in self._parcels):
             raise ValueError(f"Parcel ID {id} already exists")
         
-        parcel = Parcel(id, x, y, self._max_index, **kwargs)
+        parcel = Parcel(id, x, y, self._max_index, buffer=buffer, **kwargs)
         self._parcels.append(parcel)
 
     def update_tracking(self, object_type='all'):
@@ -419,12 +417,8 @@ class LagrangianTracking:
 ##################################################################################
 """
 TODO: (high to low priority)
-- Start visualization class
-    - not a class, just new methods in LagrangianTracking
-
 - Comment code (started)
 - Work on docstrings for ease of use
-
 
 - Rework GlacierDataProcessor to be more modular + clean (this is a later problem)
 """
@@ -438,7 +432,6 @@ class TrackedObject:
         start_index: int = 0,
         steps_forward: int = None,
         steps_reverse: int = None,
-        timeseries_length: int = None
     ):
         self.id = id
         self._history = None         # Placeholder for in-order history
@@ -600,6 +593,7 @@ class Parcel(TrackedObject):
         y: float | int,
         max_index: int,
         radius: float | int = None,
+        buffer: float | int = None,
         start_index: int = 0,
         steps_forward: int = None,
         steps_reverse: int = None
@@ -608,22 +602,23 @@ class Parcel(TrackedObject):
         self.x = x
         self.y = y
         self._radius = radius
+        self._buffer = buffer
         self._break_time = None
 
         if radius:
             self._change_areas = []
             self._change_dataset = None
-    
+        
     def _forward(self, ds):
         # Save initial (x, y) as variables
         x, y = self.x, self.y
 
         # Select inital frame, save to attribute
-        pt_data = ds.isel(mid_date=self._start_index).sel(x=x, y=y, method='nearest')
+        pt_data = self._point_data(ds, x, y, self._start_index)
         self._dataset.append(pt_data)
 
         # Selected radius around if passed
-        if self._radius: self._grab_areas(ds, self._start_index, x, y)
+        if self._radius: self._areas_data(ds, self._start_index, x, y)
 
         # Iterate through number of steps forward
         for i in range(self._steps_forward):
@@ -631,10 +626,10 @@ class Parcel(TrackedObject):
 
             # Move (x, y), select point data at *next* time index
             x, y = self._move_points(ds, x, y, t, direction=1)
-            pt_data = ds.isel(mid_date=t+1).sel(x=x, y=y, method='nearest')
+            pt_data = self._point_data(ds, x, y, t+1)
 
             # Select area around if radius passed
-            if self._radius: self._grab_areas(ds, t+1, x, y)
+            if self._radius: self._areas_data(ds, t+1, x, y)
                 
             # Add states to dataset and forward history
             self._dataset.append(pt_data)
@@ -650,16 +645,32 @@ class Parcel(TrackedObject):
 
             # Move (x, y), select point data at *previous* time index
             x, y = self._move_points(ds, x, y, t, direction=-1)
-            pt_data = ds.isel(mid_date=t-1).sel(x=x, y=y, method='nearest')
+            pt_data = self._point_data(ds, x, y, t-1)
 
             # Select area around redius if passed
-            if self._radius: self._grab_areas(ds, t-1, x, y)
+            if self._radius: self._areas_data(ds, t-1, x, y)
 
             # Add states to dataset and forward history
             self._dataset.append(pt_data)
             self._backward_history.append((x, y))
 
-    def _grab_areas(self, ds, t, x, y):
+    def _point_data(self, ds, x, y, t):
+        ds = ds.isel(mid_date=t)     # select time index
+
+        if self._buffer:
+            # Select range around point, take the spatial mean
+            ds_clip = ds.sel(
+                x=slice(x-self._buffer, x+self._buffer), 
+                y=slice(y-self._buffer, y+self._buffer)
+            ).mean(['x', 'y'], skipna=True)
+
+        else:
+            # Select nearest point
+            ds_clip = ds.sel(x=x, y=y, method='nearest')
+
+        return ds_clip
+
+    def _areas_data(self, ds, t, x, y):
         """Extract a circular area around the parcel."""
         r = self._radius
 
@@ -709,13 +720,6 @@ class Parcel(TrackedObject):
         # Create xarray dataset for difference, save as attribute
         self._change_dataset = xr.Dataset(data_vars=change_data, coords=coords).sortby('mid_date')
 
-    def find_break_time(self, thresh=0.65):
-        point_data = self._dataset
-        for i in range(len(point_data.mid_date)):
-            if point_data.fracture_conf[i] > thresh:
-                self._break_time = (point_data.isel(mid_date=i), i)
-                break
-
     def get_data(self, type):
         if type == 'all':
             return self._dataset, self._change_dataset
@@ -726,9 +730,15 @@ class Parcel(TrackedObject):
         elif type == 'area':
             return self._change_dataset
             
+    def find_break_time(self, thresh=0.65):
+        point_data = self._dataset
+        for i in range(len(point_data.mid_date)):
+            if point_data.fracture_conf[i] > thresh:
+                self._break_time = (point_data.isel(mid_date=i), i)
+                break
+
     def get_break_time(self):
         return self._break_time
-
 
 ##################################################################################
 
