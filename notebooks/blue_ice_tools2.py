@@ -394,6 +394,28 @@ class LagrangianTracking:
         
         plt.show()
 
+    def plot_stress_drop(self):
+        fig, ax = plt.subplots()
+
+        for i, parcel in enumerate(self._parcels):
+            if parcel.get_break_time():
+                parcel_t0, index = parcel.get_break_time()
+            else:
+                continue
+
+            parcel_ds = parcel.get_data('point')
+            parcel_ds = parcel_ds.isel(mid_date=slice(index, -1))
+            
+            parcel_diff = parcel_ds - parcel_t0
+
+            ax.plot(parcel_diff.von_mises, ls='-', c=f"C{i}", label=parcel.id)
+        
+        ax.set_xlim(0,15)
+        ax.set_xlabel('$\Delta t$ [months]')
+        ax.set_ylabel('$\Delta \sigma$ [kPa]')
+        ax.set_title('Change in Von Mises Stress per Month')
+        ax.legend()
+
 ##################################################################################
 """
 TODO: (high to low priority)
@@ -660,6 +682,8 @@ class Parcel(TrackedObject):
         # Compute change between timesteps if radius tracked
         if self._radius: self._compute_change()
 
+        self.find_break_time()
+
     def _compute_change(self):
         # Concatenate change areas, sort by time
         area_ds = xr.concat(self._change_areas, dim='mid_date').sortby('mid_date')
@@ -686,12 +710,11 @@ class Parcel(TrackedObject):
         self._change_dataset = xr.Dataset(data_vars=change_data, coords=coords).sortby('mid_date')
 
     def find_break_time(self, thresh=0.65):
-        if self.__tracked:
-            point_data = self._dataset
-            for i in range(len(point_data.mid_date)):
-                if point_data.fracture_conf[i] > thresh:
-                    self._break_time = point_data.mid_date[i]
-                    break
+        point_data = self._dataset
+        for i in range(len(point_data.mid_date)):
+            if point_data.fracture_conf[i] > thresh:
+                self._break_time = (point_data.isel(mid_date=i), i)
+                break
 
     def get_data(self, type):
         if type == 'all':
@@ -702,6 +725,10 @@ class Parcel(TrackedObject):
 
         elif type == 'area':
             return self._change_dataset
+            
+    def get_break_time(self):
+        return self._break_time
+
 
 ##################################################################################
 
