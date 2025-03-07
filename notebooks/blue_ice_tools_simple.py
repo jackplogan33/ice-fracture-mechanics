@@ -215,9 +215,10 @@ def get_data_cube(
         urls,
         engine=engine,
         preprocess=preprocess,
-        chunks={'x':200, 'y':200},
+        chunks='auto',
         combine='nested',
-        concat_dim='mid_date'
+        concat_dim='mid_date',
+        parallel=True
     )
         
     dc = (
@@ -925,8 +926,6 @@ def move_points(points, index, ds, reverse_direction=False, snap=False):
 
         updated_points[i] = [x, y]
 
-    # Remove duplicates if snapping is enabled
-    # return np.unique(updated_points, axis=0) if snap else updated_points
     return updated_points
 
 ##################################################################################
