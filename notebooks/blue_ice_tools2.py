@@ -440,15 +440,14 @@ class LagrangianTracking:
         self._dataset.fracture_conf[i].plot(ax=ax, cbar_kwargs={'label':'Fracture Confidence [0:1]'})
         
         for i, parcel in enumerate(self._parcels):
-            parcel_ds = parcel.get_data('point')
-        
-            ax.plot(parcel_ds.x[index], parcel_ds.y[index], markersize=2, c=f'C{i}', marker='o', ls='', label=parcel.id)
+            x, y = parcel._history[index]        
+            ax.plot(x, y, markersize=2, c=f'C{i}', marker='o', ls='')
         
         for polygon in self._polygons:
             gdf = gpd.GeoDataFrame(geometry=[polygon._history[index]], crs=tracker.epsg)
-            gdf.plot(ax=ax, facecolor='none', edgecolor='k', lw=1, label=polygon.id)
+            gdf.plot(ax=ax, facecolor='none', edgecolor='k', lw=1,)
         
-        ax.set_title('Tracked Objects on ')
+        ax.set_title(f"Tracked Objects on {np.datetime64(self._dataset.mid_date[index].data, 'D')}")
         ax.set_xlabel('x [meters]')
         ax.set_ylabel('y [meters]')
         ax.set_aspect('equal')
@@ -457,7 +456,8 @@ class LagrangianTracking:
         plt.show()
 
     def plot_stress_drop(self):
-        fig, ax = plt.subplots()
+        fig, axs = plt.subplots(3, 1, constrained_layout=True)
+        ax1, ax2, ax3 = axs
 
         for i, parcel in enumerate(self._parcels):
             if parcel.get_break_time():
@@ -468,45 +468,138 @@ class LagrangianTracking:
             parcel_ds = parcel.get_data('point')
             parcel_ds = parcel_ds.isel(mid_date=slice(index, -1))
             
-            parcel_diff = parcel_ds - parcel_t0
+            parcel_diff = parcel_ds.diff('mid_date')
 
-            ax.plot(parcel_diff.von_mises, ls='-', c=f"C{i}", label=parcel.id)
-        
-        ax.set_xlim(0,15)
-        ax.set_xlabel('$\Delta t$ [months]')
-        ax.set_ylabel('$\Delta \sigma$ [kPa]')
-        ax.set_title('Change in Von Mises Stress per Month')
-        ax.legend()
+            t = np.linspace(1, len(parcel_diff.mid_date), len(parcel_diff.mid_date), dtype='int64')
+
+            ax1.plot(t, parcel_diff.von_mises, ls='-', c=f"C{i}")
+            ax2.plot(t, parcel_diff.sigma1, ls='-', c=f'C{i}')
+            ax3.plot(t, parcel_diff.sigma2, ls='-', c=f'C{i}')
+
+        ax1.set_ylabel('$\Delta \sigma_{vm}$ [kPa]')
+        ax2.set_ylabel('$\Delta \sigma_1$ [kPa]')
+        ax3.set_ylabel('$\Delta \sigma_2$ [kPa]')
+        ax3.set_xlabel('$\Delta t$ [months]')
+
+        for ax in axs:
+            ax.set_xlim(1,16)
+
+        plt.suptitle('Change in Stress per Month\nAfter Fracture')
 
     def plot_prior_stress_change(self):
-        fig, ax = plt.subplots()
+        fig, axs = plt.subplots(3, 1, constrained_layout=True)
+        ax1, ax2, ax3 = axs
 
         for i, parcel in enumerate(self._parcels):
             if parcel.get_break_time():
                 parcel_t0, index = parcel.get_break_time()
-
             else:
                 continue
 
             parcel_ds = parcel.get_data('point')
             parcel_ds = parcel_ds.isel(mid_date=slice(0, index))
 
-            parcel_diff = parcel_ds - parcel_t0
+            parcel_diff = parcel_ds.diff('mid_date')
 
-            ax.plot(np.linspace(-len()), parcel_diff.von_mises, ls='-', c=f'C{i}', label=parcel.id)
+            t = np.linspace(-len(parcel_diff.mid_date), 0, len(parcel_diff.mid_date), dtype='int64')
+            ax1.plot(t, parcel_diff.von_mises, ls='-', c=f'C{i}')
+            ax2.plot(t, parcel_diff.sigma1, ls='-', c=f'C{i}')
+            ax3.plot(t, parcel_diff.sigma2, ls='-', c=f'C{i}')
 
-        ax.set_xlabel('$\Delta t$ [months]')
-        ax.set_ylabel('$\Delta \sigma$ [kPa]')
-        ax.set_title('Change in Von Mises Stress before Fracture')
-        ax.legend()
+        ax1.set_ylabel('$\Delta \sigma_{vm}$ [kPa]')
+        ax2.set_ylabel('$\Delta \sigma_1$ [kPa]')
+        ax3.set_ylabel('$\Delta \sigma_2$ [kPa]')
+        ax3.set_xlabel('$\Delta t$ [months]')
+
+        for ax in axs:
+            ax.set_xlim(-12, 0)
+        
+        plt.suptitle('Change in Stress per Month Before Fracture')
+
+    def plot_stress_timeseries(self):
+        fig, axs = plt.subplots(3, 1, constrained_layout=True)
+        ax1, ax2, ax3 = axs
+
+        for i, parcel in enumerate(self._parcels):
+            if parcel.get_break_time():
+                parcel_t0, index = parcel.get_break_time()
+            else:
+                continue
+
+            parcel_ds = parcel.get_data('point')
+            parcel_ds = parcel_ds.isel(mid_date=slice(index-10, index+10))
+
+            t = np.linspace(-10, 10, 20, dtype='int64')
+            ax1.plot(t, parcel_ds.von_mises, ls='-', c=f'C{i}')
+            ax2.plot(t, parcel_ds.sigma1, ls='-', c=f'C{i}')
+            ax3.plot(t, parcel_ds.sigma2, ls='-', c=f'C{i}')
+
+        ax1.set_ylabel('$\Delta \sigma_{vm}$ [kPa]')
+        ax2.set_ylabel('$\Delta \sigma_1$ [kPa]')
+        ax3.set_ylabel('$\Delta \sigma_2$ [kPa]')
+        ax3.set_xlabel('$\Delta t$ [months]')
+
+        for ax in axs:
+            ax.set_xlim(-10, 10)
+            ax.grid(ls='--', c='gray', lw='0.5', alpha=.5)
+        
+        plt.suptitle('Change in Stress per Month Before Fracture')
+
+    def area_change_gif(self, id, gif_path, delete_pngs=True, figsize=(5,8), dpi=150):
+        for parcel in self._parcels:
+            if id == parcel.id:
+                ds = parcel.get_data('area')
+    
+        img_filenames = []
+        levels = np.array([.65])
+        vmax = np.max([np.abs(ds.von_mises.max().data), np.abs(ds.von_mises.min().data)])
+        
+        for i in range(1, 54):
+            fig, ax = plt.subplots(1,1, figsize=figsize, dpi=dpi, constrained_layout=True)
+        
+            ds.von_mises[i].plot(ax=ax, cmap='coolwarm', vmax=vmax, vmin=-vmax, cbar_kwargs={'label':'$\Delta \sigma_{vm} [kPa]$'})
+            ds.fracture_conf[i].plot.contour(ax=ax, levels=levels, cmap='Greys')
+        
+            ax.set_title(None)
+            ax.set_xlabel('x [meters]')
+            ax.set_ylabel('y [meters]')
+            
+            ax.set_aspect('equal')
+
+            contour_line = mlines.Line2D([], [], color='k', linewidth=2, label='65% Fracture Confidence')
+            ax.legend(handles=[contour_line])
+        
+            if i - 1 >= 0:
+                date1 = np.datetime64(ds.mid_date[i-1].data, 'D')
+                date2 = np.datetime64(ds.mid_date[i].data, 'D')
+                date_label = f"Change in von Mises Stress\nfrom {date1} to {date2}"
+            else:
+                date_label = f"{np.datetime64(ds.mid_date[i].data, 'D')}"  # Last frame has no next timestep
+
+            plt.suptitle(date_label, weight='bold')
+    
+            filepath = gif_path+f'-{i}.png'
+            plt.savefig(filepath)
+            img_filenames.append(filepath)
+            plt.close()
+            
+        with imageio.get_writer(gif_path, duration=1000, loop=0, palettesize=32) as writer:
+            for filename in img_filenames:
+                writer.append_data(imageio.imread(filename))
+        
+        if delete_pngs:
+            for filename in img_filenames:
+                try:
+                    os.remove(filename)
+                except FileNotFoundError:
+                    print(f"Warning: {filename} not found, skipping deletion.")
 
 ##################################################################################
 """
 TODO: (high to low priority)
 - Comment code (started)
 - Work on docstrings for ease of use
-
-- Rework GlacierDataProcessor to be more modular + clean (this is a later problem)
+- Removing fractured points in Polygon class
 """
 
 class TrackedObject:
