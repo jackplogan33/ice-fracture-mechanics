@@ -67,24 +67,23 @@ class GlacierDataProcessor:
         dt_delta: float = 18,
         start_date: str | np.datetime64 = '2018-07-01',
         end_date: str | np.datetime64 = '2023-01-31',
-        chunks: str | dict = 'auto'
+        chunks: str | dict = 'auto',
+        n: float | int = 3,
+        A: float = 3.5e-25
     ):
-        self.shape = shape
-        self.points = points
-        self.epsg = epsg
-        self.urls = self.get_urls()
-        self.dt_delta = dt_delta
-        self.start_date = start_date
-        self.end_date = end_date
-        self.chunks = chunks
-        self.dataset = None
+        self._shape = shape
+        self._points = points
+        self._epsg = epsg
+        self._urls = self.get_urls()
+        self._dt_delta = dt_delta
+        self._start_date = start_date
+        self._end_date = end_date
+        self._chunks = chunks
+        self._dataset = None
 
         # Define stress and strain variables
-        self.dx = 120
-        self.dy = 120
-        self.n = 3
-        self.A = 3.5e-25
-
+        self._n = n
+        self._A = A
 
     def get_urls(self):
         """
@@ -128,11 +127,14 @@ class GlacierDataProcessor:
         """
         # preload ITS_LIVE catalog
         catalog_url = 'https://its-live-data.s3.amazonaws.com/datacubes/catalog_v02.json'
-        catalog = gpd.read_file(catalog_url).to_crs(self.epsg)  # Set to CRS of area
+        catalog = gpd.read_file(catalog_url).to_crs(self._epsg)  # Set to CRS of area
 
-        # Empty list for 
+        # Empty list to store urls
         urls = []
+
+        # get urls for any points
         if self.points is not None:
+            # convert points 
             geometry = [Point(x, y) for x, y in self.points]
             points_gdf = gpd.GeoDataFrame(geometry=geometry, crs=self.epsg)
             catalog_sub = catalog.sjoin(points_gdf, how='inner')
@@ -149,7 +151,7 @@ class GlacierDataProcessor:
 
         return np.concatenate(urls)
 
-    def get_data_cube(
+    def load_dataset(
         self,
         urls: str | list | np.ndarray = None,
         engine: str = 'zarr',
@@ -159,18 +161,19 @@ class GlacierDataProcessor:
         chunks: str | dict = 'auto',
     ):
         if urls is None:
-            urls = self.urls
+            urls = self._urls
             
         preprocess = partial(
             _preprocess, 
-            shape=self.shape,
-            epsg=self.epsg,
+            shape=self._shape,
+            epsg=self._epsg,
             dt_delta=dt_delta,
             start_date=start_date,
             end_date=end_date,
         )
 
-        self.dataset = xr.open_mfdataset(
+        # Open with xr.open_mfdataset
+        self._dataset = xr.open_mfdataset(
             urls,
             engine=engine,
             preprocess=preprocess,
@@ -179,92 +182,153 @@ class GlacierDataProcessor:
             concat_dim='mid_date'
         )
 
-        self.dataset = (
-            self.dataset.sortby('mid_date')
-            .resample(mid_date='1ME')
-            .mean(dim='mid_date', skipna=True, method='cohorts', engine='flox')
-        ).chunk({'x':100, 'y':100, 'mid_date':-1})
+        self._monthly_resample()  # resample to monthly timesteps
 
-        self.dx = self.dataset.x.diff('x')[0].item()
-        self.dy = self.dataset.y.diff('y')[0].item()
+        self.dx = self._calc_grid_spacing('x')  # get x-spacing
+        self.dy = self._calc_grid_spacing('y')  # get x-spacing
 
-        self.dataset = self.dataset.rio.write_crs(f"EPSG:{self.epsg}")
+        self._dataset = self._dataset.rio.write_crs(f"EPSG:{self.epsg}")
         
-        return self.dataset
+        return self._dataset
         
-    def compute_strain_stress(
+    def calc_strain_stress(
         self, 
         rotate: bool = True, 
         sav_gol: bool = True,
         window_length: int = 11,
         polyorder: int = 2,
-        deriv=1,
     ) -> xr.Dataset:
-        if self.dataset is None:
-            raise ValueError("Dataset not loaded. Call get_data_cube() first.")
+        if self._dataset is None:
+            raise ValueError("Dataset not loaded. Call load_dataset() first.")
 
-        if sav_gol:
-            # Apply savitzy golay filter to calculate gradients
-            # For ITS_LIVE dc:
-            ## x: axis=-1
-            ## y: axis=-2
-            L = {
-                '11':sg_ufunc(self.dataset.vx, window_length, polyorder, deriv=deriv, axis=-1) / self.dx,
-                '12':sg_ufunc(self.dataset.vx, window_length, polyorder, deriv=deriv, axis=-2) / self.dy,
-                '21':sg_ufunc(self.dataset.vy, window_length, polyorder, deriv=deriv, axis=-1) / self.dx,
-                '22':sg_ufunc(self.dataset.vy, window_length, polyorder, deriv=deriv, axis=-2) / self.dy
-            }
+        L = self._sav_gol(window_length, polyorder) if sav_gol else self._deriv()
 
-        else:
-            # Compute strain rates using xr.gradient
-            L = {
-                '11':self.dataset.vx.differentiate('x'),
-                '12':self.dataset.vx.differentiate('y'),
-                '21':self.dataset.vy.differentiate('x'),
-                '22':self.dataset.vy.differentiate('y')
-            }
+        self._calc_effective(L)  # Calculate effective strain rate
 
-        # Assign components to strain rate tensor (E)
+        if rotate: self._rotate_strain()
+
+        self._calc_stress()  # Calculate cauchy stress tensor
+
+        # Rename dataset vars for clarity
+        self._E = self._E.rename_vars({'11':'eps_xx', '12':'eps_xy', '22':'eps_yy'})
+        self._S = self._S.rename_vars({'11':'sigma1', '22':'sigma2', 'VM':'von_mises'})
+
+        self._dataset = xr.merge([self._dataset, self._E, self._S])  # Merge three datasets
+        return self._dataset
+
+    def compute_dataset(self):
+        self._dataset = self._dataset.compute()
+        return self._dataset
+
+    def get_dataset(self):
+        return self._dataset
+
+    def merge_external_dataset(self, path, **kwargs):
+        if self._dataset is None:
+            raise ValueError("Dataset not loaded. Call load_dataset() first.")
+
+        ds = xr.open_dataset(path, **kwargs)
+        self._dataset = xr.merge([self._dataset, ds])
+
+        return self._dataset
+
+    def get_stress_tensor(self):
+        return self._S
+
+    def get_strain_tensor(self):
+        return self._E
+
+    def get_epsg(self, number):
+        self._epsg = number
+
+    def _monthly_resample(self):
+        self._dataset = (
+            self._dataset.sortby('mid_date')
+            .resample(mid_date='1ME')
+            .mean(dim='mid_date', skipna=True, method='cohorts', engine='flox')
+        ).chunk({'x':100, 'y':100, 'mid_date':-1})
+    
+    def _calc_grid_spacing(self, dim):
+        diff = self._dataset[dim].diff(dim)
+
+        diff = np.unique(diff)
+
+        if diff.size > 1:
+            raise ValueError(f'Dataset does not have uniform stepping along {dim}')
+
+        setattr(self, 'd'+dim, diff[0])
+
+    def _sav_gol(self, window_length, polyorder):
+        vx = self._dataset.vx
+        vy = self._dataset.vy
+
+        return {
+            '11':sg_ufunc(vx, window_length, polyorder, deriv=1, axis=-1) / self.dx,
+            '12':sg_ufunc(vx, window_length, polyorder, deriv=1, axis=-2) / self.dy,
+            '21':sg_ufunc(vy, window_length, polyorder, deriv=1, axis=-1) / self.dx,
+            '22':sg_ufunc(vy, window_length, polyorder, deriv=1, axis=-2) / self.dy
+        }
+
+    def _deriv(self, ):
+        vx = self._dataset.vx
+        vy = self._dataset.vy
+        
+        return {
+            '11':vx.differentiate('x'),
+            '12':vx.differentiate('y'),
+            '21':vy.differentiate('x'),
+            '22':vy.differentiate('y')
+        }
+
+    def _calc_effective(self, L):
         E = {
             '11':L['11'],
             '12':0.5 * (L['12'] + L['21']),  # Symmetric part for off-diagonal terms
-            '22':L['22']
+            '22':L['22'],
+            'effective':da.sqrt(0.5 * ((L['11'] ** 2) + (L['22'] ** 2)) + ((0.5 * (L['12'] + L['21']))** 2))
         }
 
-        if rotate:
-            theta = da.arctan2(self.dataset.vy, self.dataset.vx)
-            E = rotate_strain_rates(E, theta)
+        self._E = E  # Save to attribute
 
-        # Calculate effective strain rate
-        E['effective'] = da.sqrt(
-            0.5 * ((E['11'] ** 2) + (E['22'] ** 2)) + (E['12'] ** 2)
-        )
+    def _rotate_strain(self):
+        # Calculate angle of velocity
+        theta = da.arctan2(self._dataset.vy, self._dataset.vx)  
 
-        S = calculate_stress(
-            E['effective'], E['11'], E['22'], A=self.A, n=self.n
-        )
+        # Save trig terms as variables for ease
+        cos_theta = da.cos(theta)  
+        sin_theta = da.sin(theta)
+        cos2 = cos_theta**2
+        sin2 = sin_theta**2
+        cos_sin = cos_theta * sin_theta
 
-        # Assign new variables to dataset
-        self.dataset['effective'] = E['effective']
-        self.dataset['eps_xx'] = E['11']
-        self.dataset['eps_yy'] = E['22']
-        self.dataset['von_mises'] = S['VM']
-        self.dataset['sigma1'] = S['11']
-        self.dataset['sigma2'] = S['22']
+        # rotate strain rates following Alley et. al. 2018
+        self._E = xr.Dataset({
+            '11': self._E['11'] * cos2 + 2 * self._E['12'] * cos_sin + self._E['22'] * sin2,
+            '22': self._E['11'] * sin2 - 2 * self._E['12'] * cos_sin + self._E['22'] * cos2,
+            '12': (self._E['22'] - self._E['11']) * cos_sin + self._E['12'] * (cos2 - sin2),
+            'effective':self._E['effective']
+        })
 
-        return self.dataset
+    def _calc_stress(self):
+        n = self._n
+        exp = (1 - self._n) / self._n
+        A = self._A * (365*24*3600)
 
-    def merge_and_compute(
-        self, 
-        fracture_path='../data/shirase-glacier/shirase-fracture-clipped.nc',
-        compute=True
-    ):
-        frac_ds = xr.open_dataset(fracture_path).rio.write_crs(f"EPSG:{self.epsg}")
-        self.dataset = xr.merge([self.dataset, frac_ds])
+        # Deviatoric stress tensor
+        T = {
+            '11':(A ** (-1/n)) * (self._E['effective'] ** exp) * self._E['11'],
+            '22':(A ** (-1/n)) * (self._E['effective'] ** exp) * self._E['22']
+        }
 
-        if compute:
-            self.dataset = self.dataset.compute()
-        return self.dataset
+        # Cauchy stress tensor
+        S = {
+            '11':(2 * T['11'] + T['22']) / 1000,  # Along flow component
+            '22':(T['11'] + 2 * T['22']) / 1000   # Across flow component
+        }
+
+        S['VM'] = da.sqrt((S['11']**2 + S['22']**2 - S['11'] * S['22']))  # von Mises stress
+
+        self._S = xr.Dataset(S)  # Convert to dataset, save as attribute        
 
 ##################################################################################
 
@@ -412,6 +476,28 @@ class LagrangianTracking:
         ax.set_xlabel('$\Delta t$ [months]')
         ax.set_ylabel('$\Delta \sigma$ [kPa]')
         ax.set_title('Change in Von Mises Stress per Month')
+        ax.legend()
+
+    def plot_prior_stress_change(self):
+        fig, ax = plt.subplots()
+
+        for i, parcel in enumerate(self._parcels):
+            if parcel.get_break_time():
+                parcel_t0, index = parcel.get_break_time()
+
+            else:
+                continue
+
+            parcel_ds = parcel.get_data('point')
+            parcel_ds = parcel_ds.isel(mid_date=slice(0, index))
+
+            parcel_diff = parcel_ds - parcel_t0
+
+            ax.plot(np.linspace(-len()), parcel_diff.von_mises, ls='-', c=f'C{i}', label=parcel.id)
+
+        ax.set_xlabel('$\Delta t$ [months]')
+        ax.set_ylabel('$\Delta \sigma$ [kPa]')
+        ax.set_title('Change in Von Mises Stress before Fracture')
         ax.legend()
 
 ##################################################################################
