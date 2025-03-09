@@ -133,20 +133,20 @@ class GlacierDataProcessor:
         urls = []
 
         # get urls for any points
-        if self.points is not None:
+        if self._points is not None:
             # convert points 
-            geometry = [Point(x, y) for x, y in self.points]
-            points_gdf = gpd.GeoDataFrame(geometry=geometry, crs=self.epsg)
+            geometry = [Point(x, y) for x, y in self._points]
+            points_gdf = gpd.GeoDataFrame(geometry=geometry, crs=self._epsg)
             catalog_sub = catalog.sjoin(points_gdf, how='inner')
             urls.append(catalog_sub['zarr_url'].drop_duplicates().to_numpy())
 
-        if self.shape is not None:
-            self.shape = self.shape.to_crs(self.epsg)
-            catalog_sub = catalog.sjoin(self.shape, how='inner')
+        if self._shape is not None:
+            self.shape = self._shape.to_crs(self._epsg)
+            catalog_sub = catalog.sjoin(self._shape, how='inner')
             urls.append(catalog_sub['zarr_url'].drop_duplicates().to_numpy())
             
-        if (self.points is None) and (self.shape is None):
-            catalog_sub = catalog[catalog['epsg'] == self.epsg]
+        if (self._points is None) and (self._shape is None):
+            catalog_sub = catalog[catalog['epsg'] == self._epsg]
             urls.append(catalog_sub['zarr_url'].drop_duplicates().to_numpy())
 
         return np.concatenate(urls)
@@ -179,7 +179,8 @@ class GlacierDataProcessor:
             preprocess=preprocess,
             chunks=chunks,
             combine='nested',
-            concat_dim='mid_date'
+            concat_dim='mid_date',
+            parallel=True
         )
 
         self._monthly_resample()  # resample to monthly timesteps
@@ -256,7 +257,7 @@ class GlacierDataProcessor:
         if diff.size > 1:
             raise ValueError(f'Dataset does not have uniform stepping along {dim}')
 
-        setattr(self, 'd'+dim, diff[0])
+        self.__setattr__(self, 'd'+dim, diff[0])
 
     def _sav_gol(self, window_length, polyorder):
         vx = self._dataset.vx
@@ -354,12 +355,10 @@ class LagrangianTracking:
         The xarray dataset used for tracking.
     epsg : int
         The EPSG code specifying the dataset's projection.
-    tracked_parcels : dict
-        Dictionary to store tracked parcel results.
-    tracked_polygons : dict
-        Dictionary to store tracked polygon results.
-    tracked_change_areas : dict
-        Dictionary to store tracked stress change areas.
+    tracked_parcels : list
+        List to store tracked parcel data.
+    tracked_polygons : list
+        List to store tracked polygon data.
     """
     def __init__(self, dataset, epsg=3031):
         self._dataset = dataset
@@ -370,33 +369,98 @@ class LagrangianTracking:
 
     def track_polygon(self, id, polygon, **kwargs):
         """
-        Creates and tracks a new polygon
+        Creates and tracks a new polygon.
 
-        -- Docstring needs LOVE so that it can be initialized properly
+        Parameters
+        ----------
+        id : str
+            Unique identifier for the polygon.
+        polygon : shapely.geometry.Polygon
+            Shapely polygon representing the initial location.
+        override : bool, optional
+            If True, allows overwriting an existing polygon with the same ID. 
+            Default is False.
+        **kwargs : optional
+            Additional tracking parameters, including:
+            - start_index (int): Time index where tracking starts.
+            - steps_forward (int): Steps forward to track.
+            - steps_reverse (int): Steps backward to track.
+            - remove_threshold (float): Fracture confidence threshold for pixel removal.
+
+        Raises
+        ------
+        ValueError
+            If the ID already exists and override is False.
         """
         if any(poly.id == id for poly in self._polygons):
             raise ValueError(f"Polygon ID {id} already exists")
             
+        valid_kwargs = {'start_index', 'steps_forward', 'steps_reverse', 'remove_threshold'}
+        for key in kwargs.values():
+            if key not in valid_kwargs:
+                raise ValueError(f"track_polygon() received unexpected keyword argument: {key}")
+        
         polygon = Polygon(id, polygon, self.epsg, self._max_index, **kwargs)
         self._polygons.append(polygon)
 
-    def track_parcel(self, id, x, y, buffer, **kwargs):
+    def track_parcel(self, id, x, y, override=False, **kwargs):
         """
         Creates and tracks a new parcel.
-        If track_change=True, also initializes a ChangeArea linked to this parcel.
-        
-        -- Docstring needs LOVE so that it can be initialized properly
+
+        Parameters
+        ----------
+        id : str
+            Unique identifier for the parcel.
+        x : float
+            X-coordinate of the parcel.
+        y : float
+            Y-coordinate of the parcel.
+        override : bool, optional
+            If True, allows overwriting an existing parcel with the same ID. 
+            Default is False.
+        **kwargs : optional
+            Additional tracking parameters, including:
+            - start_index (int): Time index where tracking starts.
+            - steps_forward (int): Steps forward to track.
+            - steps_reverse (int): Steps backward to track.
+            - radius (float): Radius for tracking change around the parcel.
+            - buffer (float): Distance for spatial averaging. Default is 120.
+
+        Raises
+        ------
+        ValueError
+            If the ID already exists and override is False.
         """
         if any(parc.id == id for parc in self._parcels):
             raise ValueError(f"Parcel ID {id} already exists")
         
-        parcel = Parcel(id, x, y, self._max_index, buffer=buffer, **kwargs)
+        valid_kwargs = {'start_index', 'steps_forward', 'steps_reverse', 'radius', 'buffer'}
+        for key in kwargs.keys():
+            if key not in valid_kwargs:
+                raise ValueError(f"track_parcel() received unexpected keyword argument: {key}")        
+        
+        parcel = Parcel(id, x, y, self._max_index, **kwargs)
         self._parcels.append(parcel)
 
     def update_tracking(self, object_type='all'):
         """
-        Updates the tracking for the objects stored in LagrangianTracker
+        Updates tracking for stored objects.
+
+        Parameters
+        ----------
+        object_type : str, optional
+            Specifies which objects to update. One of {'all', 'parcels', 'polygons'}. 
+            Default is 'all'.
+
+        Raises
+        ------
+        ValueError
+            If `object_type` is not one of {'all', 'parcels', 'polygons'}.
         """
+        valid_objects = {'all', 'parcels', 'polygons'}
+        if object_type not in valid_objects:
+            raise ValueError(f'Object type {object_type} not one of {valid_objects}')
+
         objects = []
 
         # Get all tracked objects
@@ -404,18 +468,26 @@ class LagrangianTracking:
             objects = self._parcels + self._polygons
 
         # Get only parcels
-        elif type == 'parcels':
+        elif object_type == 'parcels':
             objects = self._parcels
 
         # get only polygons
-        elif type == 'polygons':
+        elif object_type == 'polygons':
             objects = self._polygons
 
         # Update position for all tracked objects desired
-        for object in objects:
-            object.update(self._dataset)
+        for obj in objects:
+            obj.update(self._dataset)
     
     def get_polygon_data(self):
+        """
+        Retrieves data from tracked polygons.
+
+        Returns
+        -------
+        dict
+            Dictionary with polygon IDs as keys and polygon data as values.
+        """
         polygon_data = {}
         for polygon in self._polygons:
             polygon_data[polygon.id] = polygon.get_data()
@@ -423,28 +495,47 @@ class LagrangianTracking:
         return polygon_data
 
     def get_parcel_data(self):
+        """
+        Retrieves data from tracked parcels.
+
+        Parameters
+        ----------
+        data_type : str, optional
+            Specifies the type of parcel data to return. One of {'all', 'point', 'area'}. 
+            Default is 'all'.
+
+        Returns
+        -------
+        dict
+            Dictionary with parcel IDs as keys and corresponding data as values.
+
+        Raises
+        ------
+        ValueError
+            If `data_type` is not one of {'all', 'point', 'area'}.
+        """
+        # Raise error if invalid value passed
+        if data_type not in valid_types:
+            raise ValueError(f"Type {data_type} is not one of {valid_types}")
+
         parcel_data = {}
         for parcel in self._parcels:
-            if not parcel._radius:
-                parcel_data[parcel.id] = parcel.get_data()
-
-            else:
-                parcel_ds, change_area_ds = parcel.get_data()
-                parcel_data[parcel.id] = {'parcel':parcel_ds, 'change_area':change_area_ds}
+            if parcel.is_tracked():
+                parcel_data[parcel.id] = parcel.get_data(data_type)
 
         return parcel_data
 
     def plot_tracked_objects(self, index=27, figsize=(10,8)):
         fig, ax = plt.subplots(figsize=figsize)
                 
-        self._dataset.fracture_conf[i].plot(ax=ax, cbar_kwargs={'label':'Fracture Confidence [0:1]'})
+        self._dataset.fracture_conf[index].plot(ax=ax, cbar_kwargs={'label':'Fracture Confidence [0:1]'})
         
         for i, parcel in enumerate(self._parcels):
             x, y = parcel._history[index]        
             ax.plot(x, y, markersize=2, c=f'C{i}', marker='o', ls='')
         
         for polygon in self._polygons:
-            gdf = gpd.GeoDataFrame(geometry=[polygon._history[index]], crs=tracker.epsg)
+            gdf = gpd.GeoDataFrame(geometry=[polygon._history[index]], crs=self.epsg)
             gdf.plot(ax=ax, facecolor='none', edgecolor='k', lw=1,)
         
         ax.set_title(f"Tracked Objects on {np.datetime64(self._dataset.mid_date[index].data, 'D')}")
@@ -608,31 +699,36 @@ class TrackedObject:
         self, 
         id: str,
         max_index: int,
-        start_index: int = 0,
-        steps_forward: int = None,
-        steps_reverse: int = None,
+        **kwargs
     ):
         self.id = id
         self._history = None         # Placeholder for in-order history
         self._backward_history = []  # Save history for reverse tracking
         self._forward_history = []   # Save hsitory for forward tracking
-        self._dataset = []    # Merged dataset 
-        self.__tracked = False  # Fully Tracked ds flag
+        self._dataset = []           # Merged dataset 
+        self.__tracked = False       # Fully Tracked ds flag
 
         # Store tracking parameters
-        self._start_index = start_index
         self._max_index = max_index
-        self._steps_forward = steps_forward
-        self._steps_reverse = steps_reverse
+
+        # default kwarg values
+        defaults = {'start_index':0, 'steps_forward':None, 'steps_reverse':None}
+        defaults.update(kwargs)
+        
+        for key, val in defaults.items():
+            self.__setattr__('_'+key, val)
 
         self._validate_params()
 
     def _validate_params(self):
         """
-        Assertions and such that will validate the params, raise appropriate type errors
+        Input sanitization function
         """
         # Start index validation
-        if not isinstance(self._start_index, int) and (self._start_index <= self._max_index) and (self._start_index >= 0):
+        if not isinstance(self._start_index, int):
+            raise TypeError(f'`start_index` must be an integer')
+
+        if not (self._start_index <= self._max_index) and (self._start_index >= 0)
             raise ValueError(f"`start_index` must be an integer between 0 and {self._max_index}")
 
         # Reverse Stepping validation
@@ -647,7 +743,7 @@ class TrackedObject:
             self._steps_forward = (self._max_index - self._start_index) - 1
 
         else:
-            if not isinstance(self.steps_forward, int):
+            if not isinstance(self._steps_forward, int):
                 raise TypeError("`steps_forward` must be an integer value")
 
             if (self._steps_forward + self._start_index) > self._max_index:
@@ -664,7 +760,7 @@ class TrackedObject:
             self._forward(dataset)    # Track object forward
             self._backward(dataset)   # Track object in reverse
             self._merge_and_sort()    # Merge and timesort
-            self._merge_history()
+            self._merge_history()     # Merge histories 
             self.mark_tracked()       # Mark object as tracked
     
     def _move_points(self, ds, x, y, index, direction):
@@ -705,7 +801,7 @@ class TrackedObject:
         raise NotImplementedError('Subclasses must implement `move_points`')
 
     def get_data(self):
-        raise NotImplementedError('Subclasses must implement `get_data')
+        raise NotImplementedError('Subclasses must implement `get_data`')
 
 class Polygon(TrackedObject):
     """Class for Polygon tracking through time."""
@@ -715,17 +811,19 @@ class Polygon(TrackedObject):
         polygon,
         epsg,
         max_index,
-        start_index=0,
-        steps_forward=None,
-        steps_reverse=None,
-        remove_threshold = None
-    ):
-        super().__init__(id, max_index, start_index, steps_forward, steps_reverse)
+        **kwargs
+    ):  
+        defaults = {'remove_threshold':None}
+        defaults.update(kwargs)
+        
+        super().__init__(id, max_index, **kwargs)
         self._polygon = polygon
         self._epsg = epsg
-        self._remove_threshold = remove_threshold
         self._fractured_pts = None
         
+    def _validate_kwargs(self):
+        pass
+    
     def _forward(self, ds):
         frame = ds.isel(mid_date=self._start_index).rio.clip([self._polygon], f"EPSG:{self._epsg}", all_touched=True)
         self._dataset.append(frame)
@@ -771,17 +869,15 @@ class Parcel(TrackedObject):
         x: float | int, 
         y: float | int,
         max_index: int,
-        radius: float | int = None,
-        buffer: float | int = None,
-        start_index: int = 0,
-        steps_forward: int = None,
-        steps_reverse: int = None
+        **kwargs
     ):
-        super().__init__(id, max_index, start_index, steps_forward, steps_reverse)
+        # Creates default values for kwargs
+        defaults = {'radius':None, 'buffer':None}
+        defaults.update(kwargs)
+
+        super().__init__(id, max_index, **defaults)
         self.x = x
         self.y = y
-        self._radius = radius
-        self._buffer = buffer
         self._break_time = None
 
         if radius:
